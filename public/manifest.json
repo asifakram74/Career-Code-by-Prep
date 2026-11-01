@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "Career Code by Prep Titans",
+  "short_name": "CareerCode",
+  "description": "Student career guidance platform connecting students with expert administrators across fields like CA, MBBS, Computer Science, and Engineering.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#db2777",
+  "background_color": "#ffffff",
+  "icons": [
+    {
+      "src": "/assets/aistudio/images_87b77b11.jpg",
+      "sizes": "192x192",
+      "type": "image/jpeg",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/aistudio/images_87b77b11.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/aistudio/images_87b77b11.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg",
+      "purpose": "maskable"
+    }
+  ]
+}

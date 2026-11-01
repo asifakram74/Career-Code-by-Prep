@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#db2777" />
+      <stop offset="50%" stop-color="#e11d48" />
+      <stop offset="100%" stop-color="#9333ea" />
+    </linearGradient>
+    <linearGradient id="innerGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#fdf2f8" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#db2777" flood-opacity="0.35" />
+    </filter>
+  </defs>
+  
+  <!-- Outer Rounded Container -->
+  <rect width="512" height="512" rx="128" fill="url(#brandGrad)" />
+  
+  <!-- Glow Inner Ring -->
+  <circle cx="256" cy="256" r="170" fill="none" stroke="#ffffff" stroke-width="8" stroke-opacity="0.25" />
+  
+  <!-- Compass / Graduation Icon Combination -->
+  <g filter="url(#shadow)">
+    <!-- Graduation Cap Board -->
+    <path d="M256 140 L390 200 L256 260 L122 200 Z" fill="url(#innerGrad)" />
+    <!-- Cap Underneath Base -->
+    <path d="M165 220 L165 285 C165 330 347 330 347 285 L347 220 L256 260 Z" fill="#ffffff" fill-opacity="0.9" />
+    <!-- Tassel -->
+    <path d="M380 205 L380 290 C380 300 370 305 365 305" fill="none" stroke="#fbcfe8" stroke-width="8" stroke-linecap="round" />
+    <circle cx="365" cy="315" r="10" fill="#f43f5e" />
+    
+    <!-- Compass Rose Star Accent -->
+    <path d="M256 310 L268 355 L310 365 L268 375 L256 420 L244 375 L202 365 L244 355 Z" fill="#ffffff" />
+  </g>
+</svg>

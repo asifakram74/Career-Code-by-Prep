@@ -1,0 +1,262 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile for students, normal admins, expert admins, and super admins",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "description": "Email address" },
+        "displayName": { "type": "string", "description": "Full name" },
+        "role": { "type": "string", "enum": ["student", "normal_admin", "expert_admin", "super_admin"] },
+        "qualification": { "type": "string", "description": "Latest/previous qualification" },
+        "qualificationDetail": { "type": "string", "description": "Specific stream or major" },
+        "board": { "type": "string", "description": "Educational board (optional)" },
+        "phoneNumber": { "type": "string", "description": "Contact phone number" },
+        "professionalTitle": { "type": "string", "description": "Professional title for admins" },
+        "shortDescription": { "type": "string", "description": "Short bio or expertise description" },
+        "assignedCategories": { "type": "array", "description": "List of category IDs assigned to this admin" },
+        "status": { "type": "string", "enum": ["active", "deactivated"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastActiveAt": { "type": "string", "format": "date-time" },
+        "lastReplyAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "displayName", "role", "status", "createdAt"]
+    },
+    "AdminRef": {
+      "title": "AdminRef",
+      "description": "Trusted admin lookup entity to enforce role-based security rules",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["normal_admin", "expert_admin", "super_admin"] },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" }
+      },
+      "required": ["role", "email"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Career guidance academic/professional category",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 500 },
+        "icon": { "type": "string" },
+        "subcategories": { "type": "array" },
+        "assignedAdminIds": { "type": "array" },
+        "primaryAdminId": { "type": "string" },
+        "backupAdminId": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "inactive"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "description", "assignedAdminIds", "status", "createdAt"]
+    },
+    "Query": {
+      "title": "Query",
+      "description": "Student career guidance ticket",
+      "type": "object",
+      "properties": {
+        "ticketNumber": { "type": "string" },
+        "studentId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "studentEmail": { "type": "string" },
+        "studentPhone": { "type": "string" },
+        "studentQualification": { "type": "string" },
+        "studentBoard": { "type": "string" },
+        "categoryId": { "type": "string" },
+        "categoryName": { "type": "string" },
+        "expertId": { "type": "string" },
+        "expertName": { "type": "string" },
+        "expertRole": { "type": "string" },
+        "title": { "type": "string", "maxLength": 200 },
+        "detail": { "type": "string", "maxLength": 4000 },
+        "attachments": { "type": "array" },
+        "status": { "type": "string", "enum": ["open", "in_progress", "replied", "waiting_for_student", "resolved"] },
+        "assignmentStatus": { "type": "string", "enum": ["assigned", "unassigned", "reassigned"] },
+        "hasUnreadStudentReply": { "type": "boolean" },
+        "hasUnreadAdminReply": { "type": "boolean" },
+        "lastReplyPreview": { "type": "string" },
+        "lastReplyAt": { "type": "string", "format": "date-time" },
+        "lastSenderRole": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ticketNumber", "studentId", "studentName", "categoryId", "expertId", "title", "detail", "status", "createdAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Direct message thread item between student and assigned expert",
+      "type": "object",
+      "properties": {
+        "queryId": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "senderRole": { "type": "string", "enum": ["student", "normal_admin", "expert_admin", "super_admin"] },
+        "content": { "type": "string", "maxLength": 3000 },
+        "attachments": { "type": "array" },
+        "isRead": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["queryId", "senderId", "senderName", "senderRole", "content", "createdAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app notifications for students and administrators",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "type": { "type": "string" },
+        "queryId": { "type": "string" },
+        "isRead": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "message", "type", "isRead", "createdAt"]
+    },
+    "SavedAnswer": {
+      "title": "SavedAnswer",
+      "description": "Bookmarks saved by students that persist beyond the 15-day history window",
+      "type": "object",
+      "properties": {
+        "studentId": { "type": "string" },
+        "queryId": { "type": "string" },
+        "queryTitle": { "type": "string" },
+        "categoryName": { "type": "string" },
+        "expertName": { "type": "string" },
+        "questionText": { "type": "string" },
+        "answerText": { "type": "string" },
+        "savedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["studentId", "queryId", "queryTitle", "answerText", "savedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Security audit records of privileged administrative actions",
+      "type": "object",
+      "properties": {
+        "actorId": { "type": "string" },
+        "actorName": { "type": "string" },
+        "actorRole": { "type": "string" },
+        "action": { "type": "string" },
+        "targetId": { "type": "string" },
+        "targetType": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["actorId", "actorRole", "action", "timestamp"]
+    },
+    "Article": {
+      "title": "Article",
+      "description": "Informative guidance articles posted by administrators for all students",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "maxLength": 300 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "coverImage": { "type": "string" },
+        "content": { "type": "string" },
+        "category": { "type": "string" },
+        "tags": { "type": "array" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorRole": { "type": "string" },
+        "authorPhotoURL": { "type": "string" },
+        "authorProfessionalTitle": { "type": "string" },
+        "authorQualification": { "type": "string" },
+        "authorBio": { "type": "string" },
+        "readTimeMinutes": { "type": "number" },
+        "likesCount": { "type": "number" },
+        "likedBy": { "type": "array" },
+        "viewsCount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "description", "coverImage", "content", "authorId", "authorName", "createdAt"]
+    },
+    "CoffeeTreat": {
+      "title": "CoffeeTreat",
+      "description": "Student gratitude coffee treat donation with JazzCash payment proof",
+      "type": "object",
+      "properties": {
+        "ticketId": { "type": "string" },
+        "ticketNumber": { "type": "string" },
+        "studentId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "expertId": { "type": "string" },
+        "expertName": { "type": "string" },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "accountNumber": { "type": "string" },
+        "accountTitle": { "type": "string" },
+        "screenshotUrl": { "type": "string" },
+        "note": { "type": "string" },
+        "status": { "type": "string", "enum": ["submitted", "confirmed", "delivered"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ticketId", "studentId", "studentName", "expertName", "amount", "accountNumber", "screenshotUrl", "status", "createdAt"]
+    },
+    "PlatformReview": {
+      "title": "PlatformReview",
+      "description": "Student review and rating for the overall Career Code LMS and mentorship platform",
+      "type": "object",
+      "properties": {
+        "studentId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "studentQualification": { "type": "string" },
+        "studentAvatarUrl": { "type": "string" },
+        "rating": { "type": "number" },
+        "feedback": { "type": "string" },
+        "tags": { "type": "array" },
+        "categoryName": { "type": "string" },
+        "isPlatformReview": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["studentName", "rating", "feedback", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles for all account roles"
+    },
+    "/admins/{adminId}": {
+      "schema": "AdminRef",
+      "description": "Trusted admin role registry used for Firestore rules ABAC checks"
+    },
+    "/categories/{categoryId}": {
+      "schema": "Category",
+      "description": "Career guidance academic/professional categories"
+    },
+    "/queries/{queryId}": {
+      "schema": "Query",
+      "description": "Student tickets and career guidance queries"
+    },
+    "/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Conversation messages for query tickets"
+    },
+    "/notifications/{notificationId}": {
+      "schema": "Notification",
+      "description": "In-app notifications for students and admins"
+    },
+    "/savedAnswers/{savedAnswerId}": {
+      "schema": "SavedAnswer",
+      "description": "Student bookmarked answers persistent beyond 15 days"
+    },
+    "/auditLogs/{logId}": {
+      "schema": "AuditLog",
+      "description": "Administrative audit trail"
+    },
+    "/articles/{articleId}": {
+      "schema": "Article",
+      "description": "Informative guidance and mentorship articles posted by admins"
+    },
+    "/coffee_treats/{coffeeTreatId}": {
+      "schema": "CoffeeTreat",
+      "description": "Coffee treat contributions submitted by students for mentors"
+    },
+    "/platform_reviews/{reviewId}": {
+      "schema": "PlatformReview",
+      "description": "Overall LMS and platform reviews submitted by students and visitors"
+    }
+  }
+}
