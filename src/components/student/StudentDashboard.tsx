@@ -1,10 +1,7 @@
-import React, { useEffect, useState } from 'react';
-import { collection, query, where, onSnapshot } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { QueryTicket } from '../../types';
-import { offlineStorage } from '../../lib/offlineStorage';
+import { useLiveQueries } from '../../lib/liveData';
 import {
   PlusCircle,
   MessageSquare,
@@ -30,50 +27,12 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
   onOpenTicket,
 }) => {
   const { userProfile } = useAuth();
-  const [tickets, setTickets] = useState<QueryTicket[]>([]);
+  const uid = userProfile?.uid;
+  const { queries: tickets } = useLiveQueries({
+    enabled: Boolean(uid),
+    filter: (q) => q.studentId === uid,
+  });
   const [showReviewModal, setShowReviewModal] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!userProfile) return;
-
-    // Load initial cached tickets immediately for instant display and quota resilience
-    const cached = offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
-    if (cached && cached.length > 0) {
-      setTickets(cached);
-      setLoading(false);
-    }
-
-    const q = query(
-      collection(db, 'queries'),
-      where('studentId', '==', userProfile.uid)
-    );
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const items: QueryTicket[] = [];
-        snapshot.forEach((d) => {
-          items.push({ id: d.id, ...d.data() } as QueryTicket);
-        });
-        // Sort descending by created/updated
-        items.sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
-        setTickets(items);
-        offlineStorage.set(`cc_student_queries_${userProfile.uid}`, items);
-        setLoading(false);
-      },
-      (error) => {
-        const cachedFallback = offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
-        if (cachedFallback && cachedFallback.length > 0) {
-          setTickets(cachedFallback);
-        }
-        setLoading(false);
-        handleFirestoreError(error, OperationType.LIST, 'queries');
-      }
-    );
-
-    return () => unsubscribe();
-  }, [userProfile]);
 
   // Active non-deleted tickets for this student
   const activeTickets = tickets.filter(
@@ -240,7 +199,7 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
                           : 'bg-amber-50 text-amber-700 border border-amber-200'
                       }`}
                     >
-                      {t.status.replace('_', ' ').toUpperCase()}
+                      {(t.status || '').replace('_', ' ').toUpperCase()}
                     </span>
                     <p className="text-xs text-slate-400 sm:mt-1 tabular-nums">
                       {new Date(t.createdAt).toLocaleDateString()}

@@ -124,7 +124,10 @@ export const ArticleReaderModal: React.FC<ArticleReaderModalProps> = ({
     if (anchor && anchor.href) {
       e.preventDefault();
       e.stopPropagation();
-      window.open(anchor.href, '_blank', 'noopener,noreferrer');
+      // Only open web links; ignore javascript:, data: and other schemes.
+      if (anchor.protocol === 'http:' || anchor.protocol === 'https:') {
+        window.open(anchor.href, '_blank', 'noopener,noreferrer');
+      }
     }
   };
 

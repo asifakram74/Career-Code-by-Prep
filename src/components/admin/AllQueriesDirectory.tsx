@@ -1,22 +1,10 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  where,
-  getDocs,
-  onSnapshot,
-  doc,
-  updateDoc,
-  addDoc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { QueryTicket, UserProfile, CategoryItem, formatRoleName } from '../../types';
-import { sortCategoriesGeneralFirst } from '../../constants/officialCategories';
+import { QueryTicket, UserProfile, formatRoleName } from '../../types';
 import { ConversationView } from '../common/ConversationView';
 import { CustomSelect } from '../common/CustomSelect';
-import { offlineStorage } from '../../lib/offlineStorage';
+import { api, errorMessage } from '../../lib/api';
+import { useLiveQueries, useApiResource, sortByActivity } from '../../lib/liveData';
 import { navigationHistory } from '../../lib/navigationHistory';
 import {
   Search,
@@ -31,11 +19,12 @@ import {
 
 export const AllQueriesDirectory: React.FC = () => {
   const { userProfile } = useAuth();
-  const [queries, setQueries] = useState<QueryTicket[]>(() => {
-    return offlineStorage.get<QueryTicket[]>('cc_all_queries_dir', []);
-  });
-  const [admins, setAdmins] = useState<UserProfile[]>([]);
-  const [categories, setCategories] = useState<CategoryItem[]>([]);
+  const { queries, setQueries } = useLiveQueries({ scope: 'all' });
+  const { data: adminList } = useApiResource<UserProfile[]>('/admins', ['users'], []);
+  const admins = useMemo(
+    () => [...adminList].sort((a, b) => (a.displayName || '').localeCompare(b.displayName || '')),
+    [adminList]
+  );
   const [activeTicketId, setActiveTicketId] = useState<string | null>(null);
 
   // Directly derive activeTicket from the reactive queries state
@@ -51,6 +40,7 @@ export const AllQueriesDirectory: React.FC = () => {
   const [reassigningTicket, setReassigningTicket] = useState<QueryTicket | null>(null);
   const [newExpertId, setNewExpertId] = useState('');
   const [reassignLoading, setReassignLoading] = useState(false);
+  const [reassignError, setReassignError] = useState('');
 
   const handleChatClick = (t: QueryTicket) => {
     setActiveTicketId(t.id);
@@ -79,268 +69,32 @@ export const AllQueriesDirectory: React.FC = () => {
     };
   }, [activeTicketId]);
 
-  useEffect(() => {
-    // Load initial cached queries
-    const cached = offlineStorage.get<QueryTicket[]>('cc_all_queries_dir', []);
-    if (cached && cached.length > 0) {
-      setQueries(cached);
-    }
-
-    const unsubQueries = onSnapshot(
-      collection(db, 'queries'),
-      (snapshot) => {
-        const list: QueryTicket[] = [];
-        snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as QueryTicket));
-        list.sort((a, b) => (b.lastReplyAt || b.createdAt) - (a.lastReplyAt || a.createdAt));
-        setQueries(list);
-        offlineStorage.set('cc_all_queries_dir', list);
-      },
-      (error) => {
-        const cachedFallback = offlineStorage.get<QueryTicket[]>('cc_all_queries_dir', []);
-        if (cachedFallback && cachedFallback.length > 0) {
-          setQueries(cachedFallback);
-        }
-        handleFirestoreError(error, OperationType.LIST, 'queries');
-      }
-    );
-
-    const unsubAdmins = onSnapshot(
-      collection(db, 'users'),
-      (snapshot) => {
-        const list: UserProfile[] = [];
-        const seen = new Set<string>();
-        snapshot.forEach((d) => {
-          const u = d.data() as UserProfile;
-          if (['normal_admin', 'expert_admin', 'super_admin'].includes(u.role)) {
-            const key = (u.email || u.displayName || d.id).trim().toLowerCase();
-            if (!seen.has(key)) {
-              seen.add(key);
-              list.push({ ...u, uid: d.id });
-            }
-          }
-        });
-        list.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
-        setAdmins(list);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'users');
-      }
-    );
-
-    const unsubCategories = onSnapshot(
-      collection(db, 'categories'),
-      (snapshot) => {
-        const list: CategoryItem[] = [];
-        snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as CategoryItem));
-        setCategories(sortCategoriesGeneralFirst(list));
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'categories');
-      }
-    );
-
-    return () => {
-      unsubQueries();
-      unsubAdmins();
-      unsubCategories();
-    };
-  }, []);
+  /** Replaces tickets in the local list with fresh copies returned by the server. */
+  const upsertLocal = (...tickets: QueryTicket[]) => {
+    setQueries((prev) => {
+      const ids = new Set(tickets.map((t) => t.id));
+      return sortByActivity([...tickets, ...prev.filter((q) => !ids.has(q.id))]);
+    });
+  };
 
   const handleReassign = async () => {
     if (!reassigningTicket || !newExpertId) return;
+    if (reassigningTicket.assignmentStatus === 'reassigned') {
+      setReassignError('This ticket has already been reassigned.');
+      return;
+    }
     setReassignLoading(true);
+    setReassignError('');
     try {
-      const now = Date.now();
-      const targetAdmin = admins.find((a) => a.uid === newExpertId);
-      const targetAdminName = targetAdmin?.displayName || 'Assigned Counselor';
-      const prevAdminName = reassigningTicket.expertName || reassigningTicket.assignedAdminName || 'Previous Counselor';
-
-      // 1. In CURRENT chat: Insert subtle system message and mark as reassigned
-      await addDoc(collection(db, 'messages'), {
-        queryId: reassigningTicket.id,
-        senderId: 'system',
-        senderName: 'System',
-        senderRole: 'super_admin',
-        content: `🔄 This query has been reassigned to ${targetAdminName}.`,
-        isSystemMessage: true,
-        isRead: true,
-        createdAt: now,
-      });
-
-      const oldTicketRef = doc(db, 'queries', reassigningTicket.id);
-      await updateDoc(oldTicketRef, {
-        assignmentStatus: 'reassigned',
-        reassignedToAdminId: newExpertId,
-        reassignedToAdminName: targetAdminName,
-        status: 'resolved',
-        lastReplyPreview: `🔄 Reassigned to ${targetAdminName}`,
-        lastReplyAt: now,
-        updatedAt: now,
-      });
-
-      // 2. CHECK IF STUDENT ALREADY HAS A CHAT WITH TARGET COUNSELOR
-      const existingChatsQuery = query(
-        collection(db, 'queries'),
-        where('studentId', '==', reassigningTicket.studentId),
-        where('expertId', '==', newExpertId)
+      const res = await api.post<{ oldTicket: QueryTicket; targetTicket: QueryTicket; merged: boolean }>(
+        `/queries/${encodeURIComponent(reassigningTicket.id)}/reassign`,
+        { newExpertId }
       );
-      const existingSnap = await getDocs(existingChatsQuery);
-
-      // Filter out chats deleted for student or target admin
-      const existingList: QueryTicket[] = [];
-      existingSnap.forEach((d) => {
-        const item = { id: d.id, ...d.data() } as QueryTicket;
-        const isDeleted =
-          Array.isArray(item.deletedForUsers) &&
-          (item.deletedForUsers.includes(reassigningTicket.studentId) ||
-            item.deletedForUsers.includes(newExpertId));
-        if (!isDeleted) {
-          existingList.push(item);
-        }
-      });
-
-      let targetTicketId = '';
-      let targetTicketNumber = '';
-
-      // Find voice note if present on ticket or in messages thread
-      let voiceUrlToReassign = reassigningTicket.audioUrl;
-      let voiceDurationToReassign = reassigningTicket.audioDuration;
-
-      if (!voiceUrlToReassign) {
-        try {
-          const msgSnap = await getDocs(
-            query(collection(db, 'messages'), where('queryId', '==', reassigningTicket.id))
-          );
-          msgSnap.forEach((d) => {
-            const m = d.data();
-            if (m.audioUrl) {
-              voiceUrlToReassign = m.audioUrl;
-              voiceDurationToReassign = m.audioDuration;
-            }
-          });
-        } catch {}
-      }
-
-      if (existingList.length > 0) {
-        // EXISTING ACTIVE CHAT FOUND: Append into existing chat like a follow-up query
-        existingList.sort((a, b) => (b.lastReplyAt || b.createdAt) - (a.lastReplyAt || a.createdAt));
-        const existingChat = existingList[0];
-        targetTicketId = existingChat.id;
-        targetTicketNumber = existingChat.ticketNumber;
-
-        // Reopen existing chat if it was resolved or reassigned, or keep active with new query alert
-        await updateDoc(doc(db, 'queries', existingChat.id), {
-          status: 'open',
-          assignmentStatus: 'assigned',
-          hasUnreadStudentReply: false,
-          hasUnreadAdminReply: true,
-          isInitialQueryReadByAdmin: false,
-          lastReplyPreview: voiceUrlToReassign
-            ? `🎤 Reassigned Voice Note: ${reassigningTicket.title}`
-            : `📌 Reassigned Query: ${reassigningTicket.title}`,
-          lastReplyAt: now,
-          lastSenderRole: 'student',
-          updatedAt: now,
-          rating: null,
-          ratingFeedback: '',
-          ratingTags: [],
-          ratedAt: null,
-          ...(voiceUrlToReassign ? { audioUrl: voiceUrlToReassign, audioDuration: voiceDurationToReassign || 0 } : {}),
-        });
-
-        // Insert reassigned query into that existing chat
-        await addDoc(collection(db, 'messages'), {
-          queryId: existingChat.id,
-          senderId: reassigningTicket.studentId,
-          senderName: reassigningTicket.studentName,
-          senderRole: 'student',
-          senderAvatarUrl: reassigningTicket.studentAvatarUrl || '',
-          content: `📌 **New Query (Reassigned from ${prevAdminName}): ${reassigningTicket.title}**\n\n${reassigningTicket.detail}`,
-          ...(voiceUrlToReassign ? { audioUrl: voiceUrlToReassign, audioDuration: voiceDurationToReassign || 0 } : {}),
-          attachments: reassigningTicket.attachments || [],
-          isNewQueryHeader: true,
-          queryTitle: reassigningTicket.title,
-          isRead: false,
-          createdAt: now,
-        });
-      } else {
-        // NO EXISTING CHAT: Create new chat ticket under target admin's name
-        const newTicketNumber = `${reassigningTicket.ticketNumber.replace(/-R\d*$/, '')}-R`;
-        targetTicketNumber = newTicketNumber;
-        const newTicketData = {
-          ticketNumber: newTicketNumber,
-          studentId: reassigningTicket.studentId,
-          studentName: reassigningTicket.studentName,
-          studentEmail: reassigningTicket.studentEmail,
-          studentPhone: reassigningTicket.studentPhone || '',
-          studentQualification: reassigningTicket.studentQualification || 'Not Specified',
-          studentBoard: reassigningTicket.studentBoard || '',
-          studentAvatarUrl: reassigningTicket.studentAvatarUrl || '',
-          categoryId: reassigningTicket.categoryId,
-          categoryName: reassigningTicket.categoryName,
-          expertId: newExpertId,
-          expertEmail: targetAdmin?.email ? targetAdmin.email.toLowerCase() : '',
-          expertName: targetAdminName,
-          expertRole: targetAdmin?.role || 'normal_admin',
-          expertTitle: targetAdmin?.professionalTitle || 'Admissions Counselor',
-          expertAvatarUrl: targetAdmin?.photoURL || '',
-          assignedAdminId: newExpertId,
-          assignedAdminName: targetAdminName,
-          title: reassigningTicket.title,
-          detail: reassigningTicket.detail,
-          attachments: reassigningTicket.attachments || [],
-          status: 'open' as QueryTicket['status'],
-          assignmentStatus: 'assigned' as const,
-          hasUnreadStudentReply: false,
-          hasUnreadAdminReply: true,
-          isInitialQueryReadByAdmin: false,
-          lastReplyPreview: voiceUrlToReassign
-            ? `🎤 Voice Note: ${reassigningTicket.title}`
-            : `📌 Initial Query: ${reassigningTicket.title}`,
-          lastReplyAt: now,
-          lastSenderRole: 'student' as const,
-          reassignedFromAdminId: reassigningTicket.expertId || reassigningTicket.assignedAdminId,
-          reassignedFromAdminName: prevAdminName,
-          reassignedInitialTicketId: reassigningTicket.id,
-          createdAt: now,
-          updatedAt: now,
-          ...(voiceUrlToReassign ? { audioUrl: voiceUrlToReassign, audioDuration: voiceDurationToReassign || 0 } : {}),
-        };
-
-        const newTicketRef = await addDoc(collection(db, 'queries'), newTicketData);
-        targetTicketId = newTicketRef.id;
-        // The newly created ticket already contains title, detail, attachments, and voice note,
-        // which are rendered at the top of the chat. No duplicate message is inserted.
-      }
-
-      // 4. Notify newly assigned admin
-      await addDoc(collection(db, 'notifications'), {
-        userId: newExpertId,
-        title: `Query Reassigned to You: ${targetTicketNumber}`,
-        message: `${reassigningTicket.studentName}'s query "${reassigningTicket.title.slice(0, 60)}" has been reassigned to you from ${prevAdminName}.`,
-        type: 'new_query',
-        queryId: targetTicketId,
-        isRead: false,
-        createdAt: now,
-      }).catch(() => {});
-
-      // 5. Notify the student about reassignment
-      if (reassigningTicket.studentId) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: reassigningTicket.studentId,
-          title: `Query Reassigned to ${targetAdminName}`,
-          message: `Your query "${reassigningTicket.title.slice(0, 50)}" has been transferred to counselor ${targetAdminName}.`,
-          type: 'new_reply',
-          queryId: targetTicketId,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      }
-
+      upsertLocal(res.oldTicket, res.targetTicket);
       setReassigningTicket(null);
       setNewExpertId('');
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `queries/${reassigningTicket.id}`);
+      setReassignError(errorMessage(err, 'Failed to reassign the ticket.'));
     } finally {
       setReassignLoading(false);
     }
@@ -639,6 +393,7 @@ export const AllQueriesDirectory: React.FC = () => {
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
+                                setReassignError('');
                                 setReassigningTicket(t);
                               }}
                               className="text-[10px] text-pink-600 hover:text-pink-800 font-bold px-1.5 py-0.5 rounded hover:bg-pink-50 cursor-pointer"
@@ -692,8 +447,12 @@ export const AllQueriesDirectory: React.FC = () => {
                 </span>
                 <button
                   type="button"
-                  onClick={() => setReassigningTicket(activeTicket)}
-                  className="text-xs text-pink-700 hover:text-pink-800 font-bold px-2.5 py-1 bg-white border border-pink-200 hover:bg-pink-50 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
+                  disabled={activeTicket.assignmentStatus === 'reassigned'}
+                  onClick={() => {
+                    setReassignError('');
+                    setReassigningTicket(activeTicket);
+                  }}
+                  className="disabled:opacity-50 disabled:cursor-not-allowed text-xs text-pink-700 hover:text-pink-800 font-bold px-2.5 py-1 bg-white border border-pink-200 hover:bg-pink-50 rounded-lg shadow-2xs transition-colors shrink-0 cursor-pointer"
                 >
                   Reassign Ticket
                 </button>
@@ -704,17 +463,7 @@ export const AllQueriesDirectory: React.FC = () => {
                   ticket={activeTicket}
                   isOversight={true}
                   onClose={handleCloseChat}
-                  onUpdateTicketStatus={async (status) => {
-                    const ref = doc(db, 'queries', activeTicket.id);
-                    const updates: any = { status, updatedAt: Date.now() };
-                    if (status === 'resolved') {
-                      updates.rating = null;
-                      updates.ratingFeedback = '';
-                      updates.ratingTags = [];
-                      updates.ratedAt = null;
-                    }
-                    await updateDoc(ref, updates);
-                  }}
+                  onUpdateTicketStatus={(updated: QueryTicket) => upsertLocal(updated)}
                 />
               </div>
             </div>
@@ -774,6 +523,10 @@ export const AllQueriesDirectory: React.FC = () => {
                 />
               </div>
 
+              {reassignError && (
+                <p className="text-rose-600 font-medium bg-rose-50 border border-rose-200 rounded-lg p-2">{reassignError}</p>
+              )}
+
               <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
                 <button
                   onClick={() => setReassigningTicket(null)}
@@ -782,7 +535,7 @@ export const AllQueriesDirectory: React.FC = () => {
                   Cancel
                 </button>
                 <button
-                  disabled={!newExpertId || reassignLoading}
+                  disabled={!newExpertId || reassignLoading || reassigningTicket.assignmentStatus === 'reassigned'}
                   onClick={handleReassign}
                   className="px-4 py-1.5 bg-emerald-600 text-white rounded-xl font-semibold hover:bg-emerald-700 shadow-xs disabled:opacity-50 cursor-pointer"
                 >

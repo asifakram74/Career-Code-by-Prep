@@ -1,14 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import {
-  collection,
-  query,
-  onSnapshot,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
 import { useAuth } from '../../context/AuthContext';
 import { QueryTicket, UserProfile } from '../../types';
-import { subscribeToUnifiedReviews, unifiedReviewToTicket } from '../../lib/reviewService';
+import { subscribeToUnifiedReviews, UnifiedReviewItem } from '../../lib/reviewService';
+import { useApiResource } from '../../lib/liveData';
 import {
   Star,
   Users,
@@ -30,6 +24,38 @@ import {
   UserCheck,
 } from 'lucide-react';
 
+/** Shapes a review like a ticket so the dashboard's ticket-based views can render it. */
+function unifiedReviewToTicket(item: UnifiedReviewItem): QueryTicket {
+  return {
+    id: item.id,
+    ticketNumber: item.ticketNumber || `REV-${item.id.slice(0, 6).toUpperCase()}`,
+    studentId: item.studentId || 'guest',
+    studentName: item.studentName,
+    studentEmail: item.studentEmail || '',
+    studentQualification: item.studentQualification,
+    studentBoard: item.studentBoard,
+    studentAvatarUrl: item.studentAvatarUrl || '',
+    categoryId: item.categoryId,
+    categoryName: item.categoryName,
+    expertId: item.expertId || 'unassigned',
+    expertName: item.expertName,
+    expertRole: (item.expertRole as any) || 'normal_admin',
+    expertTitle: item.expertTitle,
+    title: item.title || 'Guidance Review',
+    detail: item.detail || item.ratingFeedback || '',
+    status: 'resolved',
+    assignmentStatus: 'assigned',
+    hasUnreadStudentReply: false,
+    hasUnreadAdminReply: false,
+    rating: item.rating,
+    ratingFeedback: item.ratingFeedback,
+    ratingTags: item.ratingTags || [],
+    ratedAt: item.ratedAt,
+    createdAt: item.ratedAt,
+    updatedAt: item.ratedAt,
+  };
+}
+
 interface ReviewsAnalyticsDashboardProps {
   onOpenTicket?: (ticket: QueryTicket) => void;
   onNavigateTab?: (tab: string) => void;
@@ -41,7 +67,11 @@ export const ReviewsAnalyticsDashboard: React.FC<ReviewsAnalyticsDashboardProps>
 }) => {
   const { userProfile } = useAuth();
   const [tickets, setTickets] = useState<QueryTicket[]>([]);
-  const [admins, setAdmins] = useState<UserProfile[]>([]);
+  const { data: adminList } = useApiResource<UserProfile[]>('/admins', ['users'], []);
+  const admins = useMemo(
+    () => [...adminList].sort((a, b) => (a.displayName || '').localeCompare(b.displayName || '')),
+    [adminList]
+  );
   const [loading, setLoading] = useState(true);
 
   // Filters & Search
@@ -64,27 +94,8 @@ export const ReviewsAnalyticsDashboard: React.FC<ReviewsAnalyticsDashboardProps>
       }
     );
 
-    const unsubUsers = onSnapshot(
-      collection(db, 'users'),
-      (snapshot) => {
-        const adminList: UserProfile[] = [];
-        snapshot.forEach((d) => {
-          const u = { uid: d.id, ...d.data() } as UserProfile;
-          if (['normal_admin', 'expert_admin', 'super_admin'].includes(u.role)) {
-            adminList.push(u);
-          }
-        });
-        adminList.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
-        setAdmins(adminList);
-      },
-      (error) => {
-        console.warn('Error fetching admins:', error);
-      }
-    );
-
     return () => {
       unsubReviews();
-      unsubUsers();
     };
   }, []);
 

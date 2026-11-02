@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { DriveConfig } from '../../types';
 import { getDriveConfig, updateDriveConfig, extractDriveFolderId } from '../../lib/driveService';
+import { errorMessage } from '../../lib/api';
 import {
   FolderGit2,
   X,
@@ -40,6 +41,9 @@ export const SuperAdminDriveModal: React.FC<SuperAdminDriveModalProps> = ({
           setFolderName(cfg.rootFolderName || 'Career Code Knowledge Base');
         }
       })
+      .catch((err) => {
+        setStatusMsg({ type: 'error', text: errorMessage(err, 'Could not load the current Drive configuration.') });
+      })
       .finally(() => setLoading(false));
   }, [isOpen]);
 
@@ -56,21 +60,17 @@ export const SuperAdminDriveModal: React.FC<SuperAdminDriveModalProps> = ({
     setStatusMsg(null);
 
     const folderId = extractDriveFolderId(folderUrl);
-    const newConfig: Partial<DriveConfig> = {
+    // The server verifies the folder is public and returns the saved config.
+    const res = await updateDriveConfig({
       rootFolderId: folderId,
       rootFolderName: folderName.trim() || 'Career Code Knowledge Base',
-      rootFolderUrl: folderUrl.startsWith('http') ? folderUrl : `https://drive.google.com/drive/folders/${folderId}`,
-      lastSyncedAt: Date.now(),
-      syncStatus: 'synced',
-    };
-
-    const res = await updateDriveConfig(newConfig);
+    });
     setSaving(false);
 
-    if (res.success) {
+    if (res.success && res.config) {
       setStatusMsg({ type: 'success', text: 'Google Drive root folder successfully connected and updated!' });
       if (onConfigSaved) {
-        onConfigSaved(newConfig as DriveConfig);
+        onConfigSaved(res.config);
       }
       setTimeout(() => {
         onClose();

@@ -1,22 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  collection,
-  query,
-  where,
-  orderBy,
-  onSnapshot,
-  addDoc,
-  doc,
-  updateDoc,
-  getDoc,
-  getDocs,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
 import { useAuth } from '../../context/AuthContext';
-import { useNotifications } from '../../context/NotificationContext';
-import { QueryTicket, ConversationMessage, AttachmentItem, UserProfile, formatRoleName, CoffeeTreatItem } from '../../types';
-import { offlineStorage } from '../../lib/offlineStorage';
+import { QueryTicket, ConversationMessage, UserProfile, formatRoleName, CoffeeTreatItem, SavedAnswerItem } from '../../types';
+import { api, errorMessage, uploadFiles } from '../../lib/api';
+import { useLiveQuery, useMessages } from '../../lib/liveData';
+import { onDataChanged, onSocket } from '../../lib/socket';
 import { CustomSelect } from './CustomSelect';
 import { CoffeeTreatModal } from './CoffeeTreatModal';
 import { LinkifiedText } from './LinkifiedText';
@@ -55,11 +42,28 @@ import {
 
 interface ConversationViewProps {
   ticket: QueryTicket;
-  onUpdateTicketStatus?: (status: QueryTicket['status']) => Promise<void>;
+  /**
+   * Called AFTER this view has saved a change through the API (status, reopen,
+   * rating, reassign, new message), with the updated ticket from the response.
+   * Never used to perform a write.
+   */
+  onUpdateTicketStatus?: (ticket: QueryTicket) => void;
   onClose?: () => void;
   onBookmarkSaved?: (msg: ConversationMessage) => void;
   isOversight?: boolean;
 }
+
+/** Counselor entry from GET /queries-meta/experts. */
+interface ExpertOption {
+  uid: string;
+  displayName: string;
+  role: UserProfile['role'];
+  professionalTitle?: string;
+  photoURL?: string;
+}
+
+/** Saved answers carry the message they bookmark (server column `messageId`). */
+type SavedAnswerWithMessage = SavedAnswerItem & { messageId?: string | null };
 
 // Voice Note Audio Player Component (WhatsApp Style)
 const WhatsAppVoicePlayer: React.FC<{ audioUrl: string; duration?: number; isMe: boolean }> = ({
@@ -236,9 +240,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   onBookmarkSaved,
   isOversight = false,
 }) => {
-  const { userProfile, updateActivityTimestamp } = useAuth();
-  const { markNotificationsForQueryAsRead } = useNotifications();
-  const [currentTicket, setCurrentTicket] = useState<QueryTicket>(ticket);
+  const { userProfile } = useAuth();
   const [showNewQueryForm, setShowNewQueryForm] = useState(false);
   const [newQueryTitle, setNewQueryTitle] = useState('');
   const [newQueryDetail, setNewQueryDetail] = useState('');
@@ -246,48 +248,65 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   const [submittingNewQuery, setSubmittingNewQuery] = useState(false);
   const [newQueryError, setNewQueryError] = useState<string | null>(null);
 
-  useEffect(() => {
-    setCurrentTicket(ticket);
-    if (ticket?.id) {
-      markNotificationsForQueryAsRead(ticket.id);
-    }
-  }, [ticket, markNotificationsForQueryAsRead]);
+  // Live ticket: starts from the prop, then follows the server copy (socket pushes).
+  const { ticket: liveTicket, setTicket: setLiveTicket } = useLiveQuery(ticket.id, ticket);
+  const currentTicket: QueryTicket = liveTicket && liveTicket.id === ticket.id ? liveTicket : ticket;
 
   useEffect(() => {
-    if (!ticket?.id) return;
-    const unsub = onSnapshot(doc(db, 'queries', ticket.id), (snap) => {
-      if (snap.exists()) {
-        setCurrentTicket({ id: snap.id, ...snap.data() } as QueryTicket);
-      }
-    });
-    return () => unsub();
-  }, [ticket?.id]);
+    setLiveTicket(ticket);
+  }, [ticket, setLiveTicket]);
 
-  const [messages, setMessages] = useState<ConversationMessage[]>(() => {
-    return offlineStorage.get<ConversationMessage[]>(`cc_chat_msgs_${ticket.id}`, []);
-  });
+  /** Applies a ticket returned by the API and tells the parent about it. */
+  const applyTicketUpdate = (updated: QueryTicket) => {
+    setLiveTicket(updated);
+    if (onUpdateTicketStatus) onUpdateTicketStatus(updated);
+  };
 
-  // Instantly load cached offline messages whenever ticket opens/changes
-  useEffect(() => {
-    const cached = offlineStorage.get<ConversationMessage[]>(`cc_chat_msgs_${ticket.id}`, []);
-    if (cached.length > 0) {
-      setMessages(cached);
-      setTimeout(() => {
-        scrollToBottom(false);
-      }, 20);
-    }
-  }, [ticket.id]);
+  // Messages of this conversation (joins the socket room while open).
+  const { messages, addMessage, loading: messagesLoading } = useMessages(ticket.id);
 
   const [newMessage, setNewMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [attachmentFiles, setAttachmentFiles] = useState<File[]>([]);
-  const [savedMessageIds, setSavedMessageIds] = useState<string[]>([]);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [savedAnswers, setSavedAnswers] = useState<SavedAnswerWithMessage[]>([]);
+  const savedMessageIds = savedAnswers.map((a) => a.messageId).filter((id): id is string => Boolean(id));
   const [showProfileDrawer, setShowProfileDrawer] = useState(false);
   const [showReassignModal, setShowReassignModal] = useState(false);
-  const [availableAdmins, setAvailableAdmins] = useState<UserProfile[]>([]);
+  const [availableAdmins, setAvailableAdmins] = useState<ExpertOption[]>([]);
   const [selectedNewAdminId, setSelectedNewAdminId] = useState('');
   const [reassigning, setReassigning] = useState(false);
   const [reassignSuccessMsg, setReassignSuccessMsg] = useState<string | null>(null);
+  const [reassignError, setReassignError] = useState<string | null>(null);
+
+  const upsertSavedAnswer = (item: SavedAnswerWithMessage) => {
+    setSavedAnswers((prev) => [item, ...prev.filter((a) => a.id !== item.id)]);
+  };
+
+  // Answers this student already bookmarked in this chat (so bookmarks don't duplicate),
+  // kept in sync with saves/deletes made elsewhere.
+  useEffect(() => {
+    setSavedAnswers([]);
+    if (userProfile?.role !== 'student' || !ticket.id) return;
+    let cancelled = false;
+    api
+      .get<SavedAnswerWithMessage[]>(`/saved-answers?queryId=${encodeURIComponent(ticket.id)}`)
+      .then((list) => {
+        if (!cancelled) setSavedAnswers(list);
+      })
+      .catch(() => {});
+    const offUpsert = onSocket<SavedAnswerWithMessage>('saved-answer:upsert', (item) => {
+      if (item.queryId === ticket.id) upsertSavedAnswer(item);
+    });
+    const offDeleted = onSocket<{ id: string }>('saved-answer:deleted', ({ id }) => {
+      setSavedAnswers((prev) => prev.filter((a) => a.id !== id));
+    });
+    return () => {
+      cancelled = true;
+      offUpsert();
+      offDeleted();
+    };
+  }, [ticket.id, userProfile?.role]);
 
   // Audio Recording State
   const [isRecording, setIsRecording] = useState(false);
@@ -436,265 +455,87 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
       setAdminDetails(null);
       return;
     }
-    const unsub = onSnapshot(
-      doc(db, 'users', adminId),
-      (snap) => {
-        if (snap.exists()) {
-          setAdminDetails({ uid: snap.id, ...snap.data() } as UserProfile);
-        }
-      },
-      (err) => {
-        console.warn('Could not fetch admin profile:', err);
-      }
-    );
-    return () => unsub();
+    let cancelled = false;
+    const load = () =>
+      api
+        .get<UserProfile>(`/users/${adminId}`)
+        .then((u) => {
+          if (!cancelled) setAdminDetails(u);
+        })
+        .catch((err) => console.warn('Could not fetch admin profile:', err));
+    load();
+    const off = onDataChanged(['users'], load);
+    return () => {
+      cancelled = true;
+      off();
+    };
   }, [ticket.expertId, ticket.assignedAdminId]);
 
   useEffect(() => {
     if (!ticket.studentId) return;
-    const unsub = onSnapshot(
-      doc(db, 'users', ticket.studentId),
-      (snap) => {
-        if (snap.exists()) {
-          setStudentDetails({ uid: snap.id, ...snap.data() } as UserProfile);
-        }
-      },
-      (err) => {
-        console.warn('Could not fetch student profile:', err);
-      }
-    );
-    return () => unsub();
+    let cancelled = false;
+    const load = () =>
+      api
+        .get<UserProfile>(`/users/${ticket.studentId}`)
+        .then((u) => {
+          if (!cancelled) setStudentDetails(u);
+        })
+        .catch((err) => console.warn('Could not fetch student profile:', err));
+    load();
+    const off = onDataChanged(['users'], load);
+    return () => {
+      cancelled = true;
+      off();
+    };
   }, [ticket.studentId]);
 
   // Load available counselors when admin opens reassign modal
   useEffect(() => {
     if (!showReassignModal) return;
-    const loadAdmins = async () => {
-      try {
-        const q = query(collection(db, 'users'), where('status', '==', 'active'));
-        const snap = await getDocs(q);
-        const list: UserProfile[] = [];
-        snap.forEach((d) => {
-          const u = { uid: d.id, ...d.data() } as UserProfile;
-          if (['super_admin', 'expert_admin', 'normal_admin'].includes(u.role) && u.uid !== userProfile?.uid) {
-            list.push(u);
-          }
-        });
-        list.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
+    let cancelled = false;
+    setReassignError(null);
+    api
+      .get<ExpertOption[]>('/queries-meta/experts')
+      .then((all) => {
+        if (cancelled) return;
+        const list = all
+          .filter((u) => u.uid !== currentTicket.expertId)
+          .sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
         setAvailableAdmins(list);
         if (list.length > 0) {
-          setSelectedNewAdminId((prev) => prev || list[0].uid);
+          setSelectedNewAdminId((prev) => (prev && list.some((a) => a.uid === prev) ? prev : list[0].uid));
         }
-      } catch (e) {
-        console.warn('Could not load admins:', e);
-      }
+      })
+      .catch((e) => {
+        if (!cancelled) setReassignError(errorMessage(e, 'Could not load counselors.'));
+      });
+    return () => {
+      cancelled = true;
     };
-    loadAdmins();
-  }, [showReassignModal, userProfile?.uid]);
+  }, [showReassignModal, currentTicket.expertId]);
 
   const handleExecuteReassignment = async () => {
     if (!selectedNewAdminId || !userProfile) return;
-    setreassigningState();
-  };
-
-  const setreassigningState = async () => {
     setReassigning(true);
+    setReassignError(null);
     try {
-      const now = Date.now();
       const targetAdmin = availableAdmins.find((a) => a.uid === selectedNewAdminId);
-      const targetAdminName = targetAdmin?.displayName || 'Assigned Counselor';
-      const prevAdminName = currentTicket.expertName || currentTicket.assignedAdminName || userProfile?.displayName || 'Previous Counselor';
-
-      // 1. In CURRENT chat: Insert subtle system message
-      await addDoc(collection(db, 'messages'), {
-        queryId: currentTicket.id,
-        senderId: 'system',
-        senderName: 'System',
-        senderRole: 'super_admin',
-        content: `🔄 This query has been reassigned to ${targetAdminName}.`,
-        isSystemMessage: true,
-        isRead: true,
-        createdAt: now,
-      });
-
-      // Update current ticket in Firestore
-      const oldTicketRef = doc(db, 'queries', currentTicket.id);
-      await updateDoc(oldTicketRef, {
-        assignmentStatus: 'reassigned',
-        reassignedToAdminId: selectedNewAdminId,
-        reassignedToAdminName: targetAdminName,
-        status: 'resolved',
-        lastReplyPreview: `🔄 Reassigned to ${targetAdminName}`,
-        lastReplyAt: now,
-        updatedAt: now,
-      });
-
-      // 2. CHECK IF STUDENT ALREADY HAS A CHAT WITH TARGET COUNSELOR
-      const existingChatsQuery = query(
-        collection(db, 'queries'),
-        where('studentId', '==', currentTicket.studentId),
-        where('expertId', '==', selectedNewAdminId)
+      // The server writes the system note, closes this chat, opens/merges the target
+      // chat and sends the notifications.
+      const { oldTicket } = await api.post<{ oldTicket: QueryTicket; targetTicket: QueryTicket; merged: boolean }>(
+        `/queries/${currentTicket.id}/reassign`,
+        { newExpertId: selectedNewAdminId }
       );
-      const existingSnap = await getDocs(existingChatsQuery);
-
-      // Filter out chats deleted for student or target admin, or already reassigned away
-      const existingList: QueryTicket[] = [];
-      existingSnap.forEach((d) => {
-        const item = { id: d.id, ...d.data() } as QueryTicket;
-        const isDeleted =
-          Array.isArray(item.deletedForUsers) &&
-          (item.deletedForUsers.includes(currentTicket.studentId) ||
-            item.deletedForUsers.includes(selectedNewAdminId));
-        if (!isDeleted) {
-          existingList.push(item);
-        }
-      });
-
-      let targetTicketId = '';
-      let targetTicketNumber = '';
-
-      // Find voice note if present on ticket or in messages thread
-      let voiceUrlToReassign = currentTicket.audioUrl || ticket.audioUrl;
-      let voiceDurationToReassign = currentTicket.audioDuration || ticket.audioDuration;
-
-      if (!voiceUrlToReassign && messages && messages.length > 0) {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].audioUrl) {
-            voiceUrlToReassign = messages[i].audioUrl;
-            voiceDurationToReassign = messages[i].audioDuration;
-            break;
-          }
-        }
-      }
-
-      if (existingList.length > 0) {
-        // EXISTING ACTIVE CHAT FOUND: Append into existing chat like a follow-up query
-        existingList.sort((a, b) => (b.lastReplyAt || b.createdAt) - (a.lastReplyAt || a.createdAt));
-        const existingChat = existingList[0];
-        targetTicketId = existingChat.id;
-        targetTicketNumber = existingChat.ticketNumber;
-
-        // Reopen existing chat if it was resolved or reassigned, or keep active with new query alert
-        await updateDoc(doc(db, 'queries', existingChat.id), {
-          status: 'open',
-          assignmentStatus: 'assigned',
-          hasUnreadStudentReply: false,
-          hasUnreadAdminReply: true,
-          isInitialQueryReadByAdmin: false,
-          lastReplyPreview: voiceUrlToReassign
-            ? `🎤 Reassigned Voice Note: ${currentTicket.title}`
-            : `📌 Reassigned Query: ${currentTicket.title}`,
-          lastReplyAt: now,
-          lastSenderRole: 'student',
-          updatedAt: now,
-          rating: null,
-          ratingFeedback: '',
-          ratingTags: [],
-          ratedAt: null,
-          ...(voiceUrlToReassign ? { audioUrl: voiceUrlToReassign, audioDuration: voiceDurationToReassign || 0 } : {}),
-        });
-
-        // Insert reassigned query into that existing chat
-        await addDoc(collection(db, 'messages'), {
-          queryId: existingChat.id,
-          senderId: currentTicket.studentId,
-          senderName: currentTicket.studentName,
-          senderRole: 'student',
-          senderAvatarUrl: currentTicket.studentAvatarUrl || '',
-          content: `📌 **New Query (Reassigned from ${prevAdminName}): ${currentTicket.title}**\n\n${currentTicket.detail}`,
-          ...(voiceUrlToReassign ? { audioUrl: voiceUrlToReassign, audioDuration: voiceDurationToReassign || 0 } : {}),
-          attachments: currentTicket.attachments || [],
-          isNewQueryHeader: true,
-          queryTitle: currentTicket.title,
-          isRead: false,
-          createdAt: now,
-        });
-      } else {
-        // NO EXISTING CHAT: Create new chat ticket under target admin's name
-        const newTicketNumber = `${currentTicket.ticketNumber.replace(/-R\d*$/, '')}-R`;
-        targetTicketNumber = newTicketNumber;
-        const newTicketData = {
-          ticketNumber: newTicketNumber,
-          studentId: currentTicket.studentId,
-          studentName: currentTicket.studentName,
-          studentEmail: currentTicket.studentEmail,
-          studentPhone: currentTicket.studentPhone || '',
-          studentQualification: currentTicket.studentQualification || 'Not Specified',
-          studentBoard: currentTicket.studentBoard || '',
-          studentAvatarUrl: currentTicket.studentAvatarUrl || '',
-          categoryId: currentTicket.categoryId,
-          categoryName: currentTicket.categoryName,
-          expertId: selectedNewAdminId,
-          expertEmail: targetAdmin?.email ? targetAdmin.email.toLowerCase() : '',
-          expertName: targetAdminName,
-          expertRole: targetAdmin?.role || 'normal_admin',
-          expertTitle: targetAdmin?.professionalTitle || 'Admissions Counselor',
-          expertAvatarUrl: targetAdmin?.photoURL || '',
-          assignedAdminId: selectedNewAdminId,
-          assignedAdminName: targetAdminName,
-          title: currentTicket.title,
-          detail: currentTicket.detail,
-          attachments: currentTicket.attachments || [],
-          status: 'open' as QueryTicket['status'],
-          assignmentStatus: 'assigned' as const,
-          hasUnreadStudentReply: false,
-          hasUnreadAdminReply: true,
-          isInitialQueryReadByAdmin: false,
-          lastReplyPreview: voiceUrlToReassign
-            ? `🎤 Voice Note: ${currentTicket.title}`
-            : `📌 Initial Query: ${currentTicket.title}`,
-          lastReplyAt: now,
-          lastSenderRole: 'student' as const,
-          reassignedFromAdminId: currentTicket.expertId || currentTicket.assignedAdminId,
-          reassignedFromAdminName: prevAdminName,
-          reassignedInitialTicketId: currentTicket.id,
-          createdAt: now,
-          updatedAt: now,
-          ...(voiceUrlToReassign ? { audioUrl: voiceUrlToReassign, audioDuration: voiceDurationToReassign || 0 } : {}),
-        };
-
-        const newTicketRef = await addDoc(collection(db, 'queries'), newTicketData);
-        targetTicketId = newTicketRef.id;
-        // The newly created ticket already contains the title, detail, attachments, and voice note,
-        // which are rendered at the top of the chat. No duplicate message is inserted.
-      }
-
-      // Notifications
-      await addDoc(collection(db, 'notifications'), {
-        userId: selectedNewAdminId,
-        title: `Query Reassigned to You: ${targetTicketNumber}`,
-        message: `${currentTicket.studentName}'s query "${currentTicket.title.slice(0, 60)}" has been reassigned to you from ${prevAdminName}.`,
-        type: 'new_query',
-        queryId: targetTicketId,
-        isRead: false,
-        createdAt: now,
-      }).catch(() => {});
-
-      if (currentTicket.studentId) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: currentTicket.studentId,
-          title: `Query Reassigned to ${targetAdminName}`,
-          message: `Your query "${currentTicket.title.slice(0, 50)}" has been transferred to counselor ${targetAdminName}.`,
-          type: 'new_reply',
-          queryId: targetTicketId,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      }
-
+      applyTicketUpdate(oldTicket);
+      const targetAdminName = oldTicket.reassignedToAdminName || targetAdmin?.displayName || 'Assigned Counselor';
       setReassignSuccessMsg(`Query successfully reassigned to ${targetAdminName}.`);
-      setCurrentTicket((prev) => ({
-        ...prev,
-        status: 'resolved',
-        assignmentStatus: 'reassigned',
-        reassignedToAdminName: targetAdminName,
-      }));
       setTimeout(() => {
         setShowReassignModal(false);
         setReassignSuccessMsg(null);
       }, 1200);
-    } catch (e: any) {
+    } catch (e) {
       console.error('Reassignment error:', e);
+      setReassignError(errorMessage(e, 'Could not reassign this query.'));
     } finally {
       setReassigning(false);
     }
@@ -747,6 +588,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   const [selectedTags, setSelectedTags] = useState<string[]>(ticket.ratingTags || []);
   const [ratingComment, setRatingComment] = useState<string>(ticket.ratingFeedback || '');
   const [submittingRating, setSubmittingRating] = useState<boolean>(false);
+  const [ratingError, setRatingError] = useState<string | null>(null);
   const [hasRatedLocally, setHasRatedLocally] = useState<boolean>(Boolean(ticket.rating));
 
   useEffect(() => {
@@ -773,27 +615,16 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   const [existingCoffeeTreat, setExistingCoffeeTreat] = useState<CoffeeTreatItem | null>(null);
   const [showReceiptViewer, setShowReceiptViewer] = useState<boolean>(false);
 
+  const loadCoffeeTreat = (queryId: string) =>
+    api
+      .get<CoffeeTreatItem | null>(`/queries/${queryId}/coffee-treat`)
+      .then((treat) => setExistingCoffeeTreat(treat || null))
+      .catch((err) => console.warn('Could not load coffee treat:', err));
+
   useEffect(() => {
     if (!ticket?.id) return;
-    const qCoffee = query(
-      collection(db, 'coffee_treats'),
-      where('ticketId', '==', ticket.id)
-    );
-    const unsub = onSnapshot(
-      qCoffee,
-      (snapshot) => {
-        if (!snapshot.empty) {
-          const treatData = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } as CoffeeTreatItem;
-          setExistingCoffeeTreat(treatData);
-        } else {
-          setExistingCoffeeTreat(null);
-        }
-      },
-      (err) => {
-        console.warn('Error listening to coffee treats:', err);
-      }
-    );
-    return () => unsub();
+    setExistingCoffeeTreat(null);
+    loadCoffeeTreat(ticket.id);
   }, [ticket?.id]);
 
   // Minimize state for resolved rating & coffee section to prevent obscuring previous chat messages
@@ -817,61 +648,37 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     5: '5 Stars — Excellent & Highly Recommended',
   };
 
+  const resetRatingForm = () => {
+    setSelectedRating(0);
+    setHoverRating(0);
+    setHasRatedLocally(false);
+    setRatingComment('');
+    setSelectedTags([]);
+  };
+
   const handleSubmitRating = async () => {
     if (selectedRating === 0 || submittingRating) return;
     setSubmittingRating(true);
+    setRatingError(null);
     try {
-      const now = Date.now();
-      const ticketRef = doc(db, 'queries', ticket.id);
-      await updateDoc(ticketRef, {
+      // The server stores the rating, updates the counselor's average and notifies them.
+      const { ticket: updated, expert } = await api.post<{
+        ticket: QueryTicket;
+        expert: { ratingCount: number; ratingSum: number; averageRating: number };
+      }>(`/queries/${currentTicket.id}/rating`, {
         rating: selectedRating,
-        ratingFeedback: ratingComment.trim(),
-        ratingTags: selectedTags,
-        ratedAt: now,
+        feedback: ratingComment.trim(),
+        tags: selectedTags,
       });
-
-      const adminId = ticket.expertId || ticket.assignedAdminId;
-      if (adminId && adminId !== 'unassigned') {
-        const adminRef = doc(db, 'users', adminId);
-        const adminSnap = await getDoc(adminRef);
-        if (adminSnap.exists()) {
-          const data = adminSnap.data();
-          const currentCount = Number(data.ratingCount) || 0;
-          const currentSum = Number(data.ratingSum) || (currentCount * (Number(data.averageRating) || 0));
-          const newCount = currentCount + 1;
-          const newSum = currentSum + selectedRating;
-          const newAverage = Math.round((newSum / newCount) * 10) / 10;
-          await updateDoc(adminRef, {
-            ratingCount: newCount,
-            ratingSum: newSum,
-            averageRating: newAverage,
-          });
-        }
-
-        await addDoc(collection(db, 'notifications'), {
-          userId: adminId,
-          title: `⭐ New ${selectedRating}-Star Rating Received!`,
-          message: `${userProfile?.displayName || 'Student'} rated your guidance on ticket #${ticket.ticketNumber} (${selectedRating}/5 stars).`,
-          type: 'query_rating',
-          queryId: ticket.id,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      }
-
-      setCurrentTicket((prev) => ({
-        ...prev,
-        rating: selectedRating,
-        ratingFeedback: ratingComment.trim(),
-        ratingTags: selectedTags,
-        ratedAt: now,
-      }));
+      applyTicketUpdate(updated);
+      setAdminDetails((prev) => (prev ? { ...prev, ...expert } : prev));
       setHasRatedLocally(true);
       setTimeout(() => {
         setIsResolvedPanelMinimized(true);
       }, 1500);
     } catch (err) {
       console.error('Failed to submit rating:', err);
+      setRatingError(errorMessage(err, 'Could not submit your rating. Please try again.'));
     } finally {
       setSubmittingRating(false);
     }
@@ -892,84 +699,19 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     setSubmittingNewQuery(true);
     setNewQueryError(null);
     try {
-      const now = Date.now();
-      const attachmentsPayload: AttachmentItem[] = [];
+      const attachments = await uploadFiles(newQueryAttachments);
+      // The server adds the header message, reopens the ticket and notifies the counselor.
+      const { message, ticket: updated } = await api.post<{ message: ConversationMessage; ticket: QueryTicket }>(
+        `/queries/${currentTicket.id}/follow-up`,
+        {
+          title: newQueryTitle.trim(),
+          detail: newQueryDetail.trim(),
+          attachments,
+        }
+      );
+      addMessage(message);
+      applyTicketUpdate(updated);
 
-      for (const file of newQueryAttachments) {
-        const reader = new FileReader();
-        const fileDataUrl = await new Promise<string>((resolve) => {
-          reader.onload = () => resolve(reader.result as string);
-          reader.readAsDataURL(file);
-        });
-        attachmentsPayload.push({
-          id: `att-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          url: fileDataUrl,
-        });
-      }
-
-      // 1. Add follow-up query as a highlighted message in this existing chat thread
-      const msgData: any = {
-        queryId: currentTicket.id,
-        senderId: userProfile.uid,
-        senderName: userProfile.displayName,
-        senderRole: userProfile.role,
-        senderAvatarUrl: userProfile.photoURL || '',
-        content: `📌 **New Query: ${newQueryTitle.trim()}**\n\n${newQueryDetail.trim()}`,
-        attachments: attachmentsPayload,
-        isNewQueryHeader: true,
-        queryTitle: newQueryTitle.trim(),
-        isRead: false,
-        createdAt: now,
-      };
-
-      await addDoc(collection(db, 'messages'), msgData);
-
-      // 2. Reopen ticket status to in_progress and reset rating
-      const ticketRef = doc(db, 'queries', currentTicket.id);
-      const updateData: any = {
-        status: 'in_progress',
-        title: newQueryTitle.trim(),
-        detail: newQueryDetail.trim(),
-        lastReplyPreview: `📌 New Query: ${newQueryTitle.trim()}`,
-        lastReplyAt: now,
-        lastSenderRole: 'student',
-        hasUnreadAdminReply: true,
-        hasUnreadStudentReply: false,
-        updatedAt: now,
-        rating: null,
-        ratingFeedback: '',
-        ratingTags: [],
-        ratedAt: null,
-      };
-
-      await updateDoc(ticketRef, updateData);
-      setCurrentTicket((prev) => ({ ...prev, ...updateData }));
-      if (onUpdateTicketStatus) {
-        onUpdateTicketStatus('in_progress');
-      }
-
-      // 3. Notify mentor
-      const mentorId =
-        currentTicket.expertId && currentTicket.expertId !== 'unassigned'
-          ? currentTicket.expertId
-          : currentTicket.assignedAdminId;
-
-      if (mentorId && mentorId !== 'unassigned') {
-        await addDoc(collection(db, 'notifications'), {
-          userId: mentorId,
-          title: `New Query from ${userProfile.displayName}: ${currentTicket.ticketNumber}`,
-          message: `Student asked a follow-up query: "${newQueryTitle.trim().slice(0, 70)}"`,
-          type: 'new_query',
-          queryId: currentTicket.id,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      }
-
-      await updateActivityTimestamp();
       setNewQueryTitle('');
       setNewQueryDetail('');
       setNewQueryAttachments([]);
@@ -978,188 +720,97 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
       setTimeout(() => {
         scrollToBottom(true);
       }, 100);
-    } catch (err: any) {
-      setNewQueryError('Failed to start new query: ' + (err.message || 'Unknown error'));
+    } catch (err) {
+      setNewQueryError('Failed to start new query: ' + errorMessage(err, 'Unknown error'));
     } finally {
       setSubmittingNewQuery(false);
     }
   };
 
   const handleUpdateTicketStatus = async (newStatus: QueryTicket['status']) => {
+    setActionError(null);
     try {
-      const ticketRef = doc(db, 'queries', currentTicket.id);
-      const updates: any = {
-        status: newStatus,
-        updatedAt: Date.now(),
-      };
-      if (newStatus === 'resolved') {
-        updates.rating = null;
-        updates.ratingFeedback = '';
-        updates.ratingTags = [];
-        updates.ratedAt = null;
-      }
-      await updateDoc(ticketRef, updates);
-      setCurrentTicket((prev) => ({
-        ...prev,
-        ...updates,
-      }));
-      if (newStatus === 'resolved') {
-        setSelectedRating(0);
-        setHoverRating(0);
-        setHasRatedLocally(false);
-        setRatingComment('');
-        setSelectedTags([]);
-      }
-      if (onUpdateTicketStatus) {
-        onUpdateTicketStatus(newStatus);
+      const updated = await api.patch<QueryTicket>(`/queries/${currentTicket.id}/status`, { status: newStatus });
+      applyTicketUpdate(updated);
+      if (newStatus === 'resolved' && !updated.rating) {
+        resetRatingForm();
       }
     } catch (e) {
       console.error('Failed to update status:', e);
+      setActionError(errorMessage(e, 'Could not update the status.'));
     }
   };
 
+  const reopenTicket = async () => {
+    // The server reopens the ticket and clears the previous rating.
+    const updated = await api.post<QueryTicket>(`/queries/${currentTicket.id}/reopen`);
+    applyTicketUpdate(updated);
+    resetRatingForm();
+  };
+
   const handleReopenQuickChat = async () => {
+    setActionError(null);
     try {
-      const ticketRef = doc(db, 'queries', currentTicket.id);
-      await updateDoc(ticketRef, {
-        status: 'in_progress',
-        hasUnreadAdminReply: true,
-        hasUnreadStudentReply: false,
-        rating: null,
-        ratingFeedback: '',
-        ratingTags: [],
-        ratedAt: null,
-        updatedAt: Date.now(),
-      });
-      setCurrentTicket((prev) => ({
-        ...prev,
-        status: 'in_progress',
-        rating: null as any,
-        ratingFeedback: '',
-        ratingTags: [],
-        ratedAt: null as any,
-      }));
-      setSelectedRating(0);
-      setHoverRating(0);
-      setHasRatedLocally(false);
-      setRatingComment('');
-      setSelectedTags([]);
-      if (onUpdateTicketStatus) {
-        onUpdateTicketStatus('in_progress');
-      }
+      await reopenTicket();
       setTimeout(() => {
         textInputRef.current?.focus();
       }, 100);
     } catch (e) {
       console.error(e);
+      setActionError(errorMessage(e, 'Could not reopen this chat.'));
     }
   };
 
   const handleAdminReopenChat = async () => {
+    setActionError(null);
     try {
-      const ticketRef = doc(db, 'queries', currentTicket.id);
-      await updateDoc(ticketRef, {
-        status: 'in_progress',
-        rating: null,
-        ratingFeedback: '',
-        ratingTags: [],
-        ratedAt: null,
-        updatedAt: Date.now(),
-      });
-      setCurrentTicket((prev) => ({
-        ...prev,
-        status: 'in_progress',
-        rating: null as any,
-        ratingFeedback: '',
-        ratingTags: [],
-        ratedAt: null as any,
-      }));
-      setSelectedRating(0);
-      setHoverRating(0);
-      setHasRatedLocally(false);
-      setRatingComment('');
-      setSelectedTags([]);
-      if (onUpdateTicketStatus) {
-        onUpdateTicketStatus('in_progress');
-      }
+      await reopenTicket();
     } catch (e) {
       console.error(e);
+      setActionError(errorMessage(e, 'Could not reopen this chat.'));
     }
   };
 
-  // Listen to messages for this ticket
+  // Keep the newest message in view.
   useEffect(() => {
-    const q = query(
-      collection(db, 'messages'),
-      where('queryId', '==', ticket.id),
-      orderBy('createdAt', 'asc')
-    );
+    if (messages.length === 0) return;
+    const timer = setTimeout(() => {
+      scrollToBottom(true);
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [messages.length, ticket.id]);
 
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const msgs: ConversationMessage[] = [];
-        snapshot.forEach((d) => {
-          msgs.push({ id: d.id, ...d.data() } as ConversationMessage);
-        });
-        setMessages(msgs);
-        offlineStorage.set(`cc_chat_msgs_${ticket.id}`, msgs);
-        setTimeout(() => {
-          scrollToBottom(true);
-        }, 80);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'messages');
-      }
-    );
-
-    return () => unsubscribe();
+  // Mark the chat read once per open. The server decides what that means: it always
+  // marks my notifications for this query read, and only for the student / assigned
+  // admin does it clear the unread flags and turn the counterpart's ticks blue
+  // (oversight viewers leave the unread state untouched).
+  useEffect(() => {
+    if (!ticket.id) return;
+    api.post(`/queries/${ticket.id}/read`).catch(() => {
+      // Non-blocking
+    });
   }, [ticket.id]);
 
-  // Mark unread ticket flags as read on mount ONLY if viewing user is student OR the assigned admin!
-  // When super_admin or expert_admin opens any chat in oversight mode, do NOT mark as opened/read.
+  // While the chat is open, mark newly arriving counterpart messages read (one call per
+  // new batch, not one write per message). Oversight viewers never mark messages read.
+  const readTriggerRef = useRef<{ queryId: string; lastId: string | null } | null>(null);
   useEffect(() => {
-    const markRead = async () => {
-      try {
-        const ticketRef = doc(db, 'queries', ticket.id);
-        if (isStudent && ticket.hasUnreadStudentReply) {
-          await updateDoc(ticketRef, { hasUnreadStudentReply: false });
-        } else if (isAdmin && isAssignedAdmin) {
-          const updates: any = {};
-          if (ticket.hasUnreadAdminReply) updates.hasUnreadAdminReply = false;
-          if (!ticket.isInitialQueryReadByAdmin) updates.isInitialQueryReadByAdmin = true;
-          if (Object.keys(updates).length > 0) {
-            await updateDoc(ticketRef, updates);
-          }
-        }
-      } catch (err) {
-        // Non-blocking
-      }
-    };
-    markRead();
-  }, [ticket.id, isStudent, isAdmin, isAssignedAdmin, ticket.hasUnreadStudentReply, ticket.hasUnreadAdminReply, ticket.isInitialQueryReadByAdmin]);
-
-  // Mark all unread messages sent by counterparty as read so they get genuine blue ticks
-  // ONLY if student is viewing, OR the assigned admin is viewing!
-  // Oversight super/expert admins should NOT turn the student's ticks blue!
-  useEffect(() => {
-    if (!userProfile || messages.length === 0) return;
-    if (isAdmin && !isAssignedAdmin) return; // Do NOT mark messages as read for oversight viewers!
-
-    const unreadMessages = messages.filter(
-      (m) => m.senderId !== userProfile.uid && !m.isRead
-    );
-
-    if (unreadMessages.length > 0) {
-      unreadMessages.forEach(async (m) => {
-        try {
-          await updateDoc(doc(db, 'messages', m.id), { isRead: true });
-        } catch (e) {
-          // Non-blocking
-        }
-      });
+    if (!userProfile || messagesLoading) return;
+    if (messages.some((m) => m.queryId !== ticket.id)) return; // stale list from the previous chat
+    const unread = messages.filter((m) => m.senderId !== userProfile.uid && !m.isRead && !m.isSystemMessage);
+    const latestId = unread.length > 0 ? unread[unread.length - 1].id : null;
+    if (!readTriggerRef.current || readTriggerRef.current.queryId !== ticket.id) {
+      // First load of this chat: the open-time /read call already covers these.
+      readTriggerRef.current = { queryId: ticket.id, lastId: latestId };
+      return;
     }
-  }, [messages, userProfile, isAdmin, isAssignedAdmin]);
+    if (!latestId || latestId === readTriggerRef.current.lastId) return;
+    if (isAdmin && !isAssignedAdmin) return;
+    readTriggerRef.current.lastId = latestId;
+    api.post(`/queries/${ticket.id}/read`).catch(() => {
+      // Non-blocking
+    });
+  }, [messages, messagesLoading, userProfile, isAdmin, isAssignedAdmin, ticket.id]);
 
   // Cleanup audio recorder on unmount
   // Safe audio cleanup
@@ -1206,102 +857,62 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     return '';
   };
 
-  // Central voice message publisher to Firestore
+  // Uploads a voice note and posts it; the server updates the ticket and notifies.
   const sendVoiceMessagePayload = async (
-    base64Audio: string,
+    audio: Blob,
+    fileName: string,
     duration: number,
     customTitle?: string
   ) => {
     if (!userProfile) return;
-    const now = Date.now();
     const finalDuration = Math.max(1, Math.round(duration));
-
-    const msgData = {
-      queryId: ticket.id,
-      senderId: userProfile.uid,
-      senderName: userProfile.displayName,
-      senderRole: userProfile.role,
-      senderAvatarUrl: userProfile.photoURL || '',
-      content: customTitle ? `🎤 Voice Note (${customTitle})` : '🎤 Voice Message',
-      audioUrl: base64Audio,
-      audioDuration: finalDuration,
-      attachments: [],
-      isRead: false,
-      createdAt: now,
-    };
-
-    await addDoc(collection(db, 'messages'), msgData);
-
-    // Update query ticket
-    const ticketRef = doc(db, 'queries', ticket.id);
-    const isSenderStudent = userProfile.role === 'student';
-    const updateData: any = {
-      lastReplyPreview: '🎤 Voice Message',
-      lastReplyAt: now,
-      lastSenderRole: userProfile.role,
-      lastSenderName: userProfile.displayName,
-      lastSenderId: userProfile.uid,
-      updatedAt: now,
-    };
-
-    if (isSenderStudent) {
-      updateData.hasUnreadAdminReply = true;
-      if (ticket.status === 'replied' || ticket.status === 'resolved' || currentTicket.status === 'resolved') {
-        updateData.status = 'in_progress';
-      }
-    } else {
-      updateData.hasUnreadStudentReply = true;
-      updateData.status = 'replied';
-      const adminUserRef = doc(db, 'users', userProfile.uid);
-      await updateDoc(adminUserRef, { lastReplyAt: now }).catch(() => {});
+    setSending(true);
+    try {
+      const [uploaded] = await uploadFiles([audio instanceof File ? audio : { blob: audio, name: fileName }]);
+      const { message, ticket: updated } = await api.post<{ message: ConversationMessage; ticket: QueryTicket }>(
+        `/queries/${ticket.id}/messages`,
+        {
+          content: customTitle ? `🎤 Voice Note (${customTitle})` : '🎤 Voice Message',
+          attachments: [],
+          audioUrl: uploaded.url,
+          audioDuration: finalDuration,
+        }
+      );
+      addMessage(message);
+      applyTicketUpdate(updated);
+    } catch (err) {
+      console.error('Failed to send voice note:', err);
+      setRecordingError(errorMessage(err, 'Could not send the voice note. Please try again.'));
+    } finally {
+      setSending(false);
     }
-
-    if (currentTicket.rating || ticket.rating) {
-      updateData.rating = null;
-      updateData.ratingFeedback = '';
-      updateData.ratingTags = [];
-      updateData.ratedAt = null;
-    }
-
-    await updateDoc(ticketRef, updateData);
-
-    const recipientId = isSenderStudent
-      ? (ticket.expertId && ticket.expertId !== 'unassigned' ? ticket.expertId : (ticket.assignedAdminId && ticket.assignedAdminId !== 'unassigned' ? ticket.assignedAdminId : ''))
-      : ticket.studentId;
-
-    if (recipientId) {
-      await addDoc(collection(db, 'notifications'), {
-        userId: recipientId,
-        title: isSenderStudent
-          ? `Student Voice Note: ${ticket.ticketNumber}`
-          : `Expert Voice Note: ${ticket.ticketNumber}`,
-        message: `${userProfile.displayName} sent a voice note (${finalDuration}s)`,
-        type: 'new_reply',
-        queryId: ticket.id,
-        isRead: false,
-        createdAt: now,
-      }).catch(() => {});
-    } else if (isSenderStudent) {
-      try {
-        const adminsSnap = await getDocs(
-          query(collection(db, 'users'), where('role', 'in', ['super_admin', 'expert_admin', 'normal_admin']))
-        );
-        adminsSnap.forEach(async (adminDoc) => {
-          await addDoc(collection(db, 'notifications'), {
-            userId: adminDoc.id,
-            title: `Student Voice Note: ${ticket.ticketNumber}`,
-            message: `${userProfile.displayName} sent a voice note (${finalDuration}s)`,
-            type: 'new_reply',
-            queryId: ticket.id,
-            isRead: false,
-            createdAt: now,
-          }).catch(() => {});
-        });
-      } catch {}
-    }
-
-    await updateActivityTimestamp();
   };
+
+  const voiceFileName = (mime: string) => {
+    const ext = mime.includes('mp4')
+      ? 'm4a'
+      : mime.includes('ogg')
+      ? 'ogg'
+      : mime.includes('wav')
+      ? 'wav'
+      : mime.includes('aac')
+      ? 'aac'
+      : 'webm';
+    return `voice-note-${Date.now()}.${ext}`;
+  };
+
+  const readAudioDuration = (file: File) =>
+    new Promise<number>((resolve) => {
+      const url = URL.createObjectURL(file);
+      const tempAudio = new Audio();
+      const done = (value: number) => {
+        URL.revokeObjectURL(url);
+        resolve(value);
+      };
+      tempAudio.onloadedmetadata = () => done(Math.round(tempAudio.duration) || 4);
+      tempAudio.onerror = () => done(4);
+      tempAudio.src = url;
+    });
 
   // START RECORDING VOICE MESSAGE
   const startVoiceRecording = async () => {
@@ -1365,26 +976,22 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     const duration = recordingSeconds || 1;
 
     mediaRecorderRef.current.onstop = async () => {
+      let audioBlob: Blob | null = null;
+      const mime = mimeTypeRef.current || 'audio/webm';
       try {
         if (audioChunksRef.current.length === 0) {
           setRecordingError('No audio data captured. Please speak into your mic and try again.');
           return;
         }
-
-        const audioBlob = new Blob(audioChunksRef.current, {
-          type: mimeTypeRef.current || 'audio/webm',
-        });
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          const base64Audio = reader.result as string;
-          await sendVoiceMessagePayload(base64Audio, duration);
-        };
-        reader.readAsDataURL(audioBlob);
+        audioBlob = new Blob(audioChunksRef.current, { type: mime });
       } catch (err: any) {
         console.error('Error saving voice recording:', err);
         setRecordingError('Failed to encode voice note.');
       } finally {
         cleanupAudioStream();
+      }
+      if (audioBlob) {
+        await sendVoiceMessagePayload(audioBlob, voiceFileName(mime), duration);
       }
     };
 
@@ -1405,96 +1012,11 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
   // Upload an audio memo / voice file directly
   const handleAudioFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file || !userProfile) return;
     setRecordingError(null);
-
-    try {
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const base64Audio = reader.result as string;
-        const tempAudio = new Audio(base64Audio);
-        tempAudio.onloadedmetadata = async () => {
-          const dur = Math.round(tempAudio.duration) || 4;
-          await sendVoiceMessagePayload(base64Audio, dur, file.name);
-        };
-        tempAudio.onerror = async () => {
-          await sendVoiceMessagePayload(base64Audio, 4, file.name);
-        };
-      };
-      reader.readAsDataURL(file);
-    } catch (err: any) {
-      setRecordingError('Could not upload audio note: ' + err.message);
-    }
-    e.target.value = '';
-  };
-
-  // Send a test voice note using Web Audio API synthesis
-  const handleSendTestVoiceNote = async () => {
-    if (!userProfile) return;
-    setRecordingError(null);
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) {
-        setRecordingError('Web Audio is not supported in this browser.');
-        return;
-      }
-      const ctx = new AudioCtx();
-      const sampleRate = ctx.sampleRate;
-      const durationSeconds = 3;
-      const numFrames = sampleRate * durationSeconds;
-      const buffer = ctx.createBuffer(1, numFrames, sampleRate);
-      const data = buffer.getChannelData(0);
-
-      for (let i = 0; i < numFrames; i++) {
-        const t = i / sampleRate;
-        const freq = t < 1 ? 392 : t < 2 ? 440 : 523.25; // G4 -> A4 -> C5
-        const envelope = Math.sin((Math.PI * (t % 1)) / 1);
-        data[i] = Math.sin(2 * Math.PI * freq * t) * 0.25 * envelope;
-      }
-
-      // Convert buffer to WAV
-      const numChannels = 1;
-      const bitDepth = 16;
-      const bytesPerSample = bitDepth / 8;
-      const blockAlign = numChannels * bytesPerSample;
-      const dataLength = data.length * bytesPerSample;
-      const arrayBuffer = new ArrayBuffer(44 + dataLength);
-      const view = new DataView(arrayBuffer);
-
-      const writeStr = (offset: number, str: string) => {
-        for (let j = 0; j < str.length; j++) view.setUint8(offset + j, str.charCodeAt(j));
-      };
-
-      writeStr(0, 'RIFF');
-      view.setUint32(4, 36 + dataLength, true);
-      writeStr(8, 'WAVE');
-      writeStr(12, 'fmt ');
-      view.setUint32(16, 16, true);
-      view.setUint16(20, 1, true); // PCM
-      view.setUint16(22, numChannels, true);
-      view.setUint32(24, sampleRate, true);
-      view.setUint32(28, sampleRate * blockAlign, true);
-      view.setUint16(32, blockAlign, true);
-      view.setUint16(34, bitDepth, true);
-      writeStr(36, 'data');
-      view.setUint32(40, dataLength, true);
-
-      let offset = 44;
-      for (let i = 0; i < data.length; i++, offset += 2) {
-        const s = Math.max(-1, Math.min(1, data[i]));
-        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-      }
-
-      const wavBlob = new Blob([arrayBuffer], { type: 'audio/wav' });
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const base64 = reader.result as string;
-        await sendVoiceMessagePayload(base64, durationSeconds, 'Voice Note');
-      };
-      reader.readAsDataURL(wavBlob);
-    } catch (e: any) {
-      setRecordingError('Failed to create test audio note: ' + e.message);
-    }
+    const dur = await readAudioDuration(file);
+    await sendVoiceMessagePayload(file, file.name, dur, file.name);
   };
 
   // SEND TEXT OR FILE MESSAGE
@@ -1505,11 +1027,12 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
     const textToSend = newMessage.trim();
     const filesToSend = [...attachmentFiles];
     if (!textToSend && filesToSend.length === 0) return;
-    if (!userProfile) return;
+    if (!userProfile || sending) return;
 
     // Immediately clear text input and attachments state so UI resets instantly
     setNewMessage('');
     setAttachmentFiles([]);
+    setActionError(null);
     if (textInputRef.current) {
       textInputRef.current.value = '';
       textInputRef.current.style.height = 'auto';
@@ -1517,132 +1040,43 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
 
     setSending(true);
     try {
-      const now = Date.now();
-      const attachmentsPayload: AttachmentItem[] = [];
-
-      for (const file of filesToSend) {
-        const reader = new FileReader();
-        const fileDataUrl = await new Promise<string>((resolve) => {
-          reader.onload = () => resolve(reader.result as string);
-          reader.readAsDataURL(file);
-        });
-        attachmentsPayload.push({
-          id: `att-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          url: fileDataUrl,
-        });
-      }
-
-      // Add to messages collection
-      const msgData = {
-        queryId: ticket.id,
-        senderId: userProfile.uid,
-        senderName: userProfile.displayName,
-        senderRole: userProfile.role,
-        senderAvatarUrl: userProfile.photoURL || '',
-        content: textToSend,
-        attachments: attachmentsPayload,
-        isRead: false,
-        createdAt: now,
-      };
-
-      await addDoc(collection(db, 'messages'), msgData);
-
-      // Update query ticket metadata
-      const ticketRef = doc(db, 'queries', ticket.id);
-      const isSenderStudent = userProfile.role === 'student';
-
-      const updateData: any = {
-        lastReplyPreview: textToSend.slice(0, 120) || (attachmentsPayload.length > 0 ? '📎 File Attachment' : ''),
-        lastReplyAt: now,
-        lastSenderRole: userProfile.role,
-        lastSenderName: userProfile.displayName,
-        lastSenderId: userProfile.uid,
-        updatedAt: now,
-      };
-
-      if (isSenderStudent) {
-        updateData.hasUnreadAdminReply = true;
-        if (ticket.status === 'replied' || ticket.status === 'resolved' || currentTicket.status === 'resolved') {
-          updateData.status = 'in_progress';
-        }
-      } else {
-        updateData.hasUnreadStudentReply = true;
-        updateData.status = 'replied';
-        const adminUserRef = doc(db, 'users', userProfile.uid);
-        await updateDoc(adminUserRef, { lastReplyAt: now }).catch(() => {});
-      }
-
-      if (currentTicket.rating || ticket.rating) {
-        updateData.rating = null;
-        updateData.ratingFeedback = '';
-        updateData.ratingTags = [];
-        updateData.ratedAt = null;
-      }
-
-      await updateDoc(ticketRef, updateData);
-
-      const recipientId = isSenderStudent
-        ? (ticket.expertId && ticket.expertId !== 'unassigned' ? ticket.expertId : (ticket.assignedAdminId && ticket.assignedAdminId !== 'unassigned' ? ticket.assignedAdminId : ''))
-        : ticket.studentId;
-
-      if (recipientId) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: recipientId,
-          title: isSenderStudent ? `Student Reply: ${ticket.ticketNumber}` : `Expert Reply: ${ticket.ticketNumber}`,
-          message: `${userProfile.displayName}: ${textToSend.slice(0, 80) || 'Sent an attachment'}`,
-          type: 'new_reply',
-          queryId: ticket.id,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      } else if (isSenderStudent) {
-        try {
-          const adminsSnap = await getDocs(
-            query(collection(db, 'users'), where('role', 'in', ['super_admin', 'expert_admin', 'normal_admin']))
-          );
-          adminsSnap.forEach(async (adminDoc) => {
-            await addDoc(collection(db, 'notifications'), {
-              userId: adminDoc.id,
-              title: `Student Reply: ${ticket.ticketNumber}`,
-              message: `${userProfile.displayName}: ${textToSend.slice(0, 80) || 'Sent an attachment'}`,
-              type: 'new_reply',
-              queryId: ticket.id,
-              isRead: false,
-              createdAt: now,
-            }).catch(() => {});
-          });
-        } catch {}
-      }
-
-      await updateActivityTimestamp();
+      const attachments = await uploadFiles(filesToSend);
+      // The server updates the ticket preview/status/unread flags and notifies the other side.
+      const { message, ticket: updated } = await api.post<{ message: ConversationMessage; ticket: QueryTicket }>(
+        `/queries/${ticket.id}/messages`,
+        { content: textToSend, attachments }
+      );
+      addMessage(message);
+      applyTicketUpdate(updated);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'messages');
+      console.error('Failed to send message:', err);
+      // Give the user back what they typed / attached so nothing is lost.
+      setNewMessage((cur) => (cur.trim() ? `${textToSend}\n${cur}` : textToSend));
+      setAttachmentFiles((cur) => [...filesToSend, ...cur]);
+      setActionError(errorMessage(err, 'Message could not be sent. Please try again.'));
     } finally {
       setSending(false);
     }
   };
 
   const handleSaveAnswerBookmark = async (msg: ConversationMessage) => {
-    if (!userProfile) return;
+    if (!userProfile || savedMessageIds.includes(msg.id)) return;
+    setActionError(null);
     try {
-      const now = Date.now();
-      await addDoc(collection(db, 'savedAnswers'), {
-        studentId: userProfile.uid,
+      const saved = await api.post<SavedAnswerWithMessage>('/saved-answers', {
         queryId: ticket.id,
+        messageId: msg.id,
         queryTitle: ticket.title,
         categoryName: ticket.categoryName,
         expertName: msg.senderName,
         questionText: ticket.detail,
         answerText: msg.content,
-        savedAt: now,
       });
-      setSavedMessageIds((prev) => [...prev, msg.id]);
+      upsertSavedAnswer({ ...saved, messageId: saved.messageId || msg.id });
       if (onBookmarkSaved) onBookmarkSaved(msg);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'savedAnswers');
+      console.error('Failed to save answer:', err);
+      setActionError(errorMessage(err, 'Could not save this answer.'));
     }
   };
 
@@ -1985,33 +1419,17 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
           })()}
         </div>
 
-        {/* FOLLOW-UP MESSAGES THREAD (Filtered to never duplicate the initial reassigned query) */}
+        {/* FOLLOW-UP MESSAGES THREAD */}
         {(() => {
-          const isReassignedTicket = Boolean(
-            currentTicket.reassignedFromAdminName ||
-            currentTicket.reassignedInitialTicketId ||
-            currentTicket.ticketNumber?.includes('-R') ||
-            ticket.reassignedFromAdminName ||
-            ticket.ticketNumber?.includes('-R')
-          );
-
-          const displayMessages = messages.filter((msg) => {
-            if (
-              isReassignedTicket &&
-              (msg.content?.startsWith('📌 **Reassigned Query:') || msg.content?.startsWith('📌 Reassigned Query:'))
-            ) {
-              return false;
-            }
-            return true;
-          });
-
-          return displayMessages.map((msg) => {
+          // Formatting comes only from server-set flags, never from message text
+          // (a user could type "🔄 ..." or "📌 **New Query: ..." themselves).
+          return messages.map((msg) => {
             const isMe = msg.senderId === userProfile?.uid;
             const isMsgAdmin = msg.senderRole !== 'student';
             const isSaved = savedMessageIds.includes(msg.id);
-            const isNewQuery = Boolean(msg.isNewQueryHeader || msg.content?.startsWith('📌 **New Query:'));
+            const isNewQuery = Boolean(msg.isNewQueryHeader);
 
-          if (msg.isSystemMessage || msg.senderId === 'system' || msg.content?.startsWith('🔄')) {
+          if (msg.isSystemMessage) {
             return (
               <div key={msg.id} className="w-full my-3 flex justify-center select-none animate-fade-in px-4">
                 <div className="bg-amber-50 border border-amber-200/90 text-amber-900 text-xs px-4 py-2 rounded-2xl shadow-2xs flex items-center gap-2 max-w-md text-center leading-relaxed">
@@ -2091,7 +1509,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                       </div>
                       <p className="whitespace-pre-wrap leading-relaxed text-[14px] text-slate-800">
                         <LinkifiedText
-                          text={msg.content.replace(/^📌 \*\*New Query:[^\n]+\*\*\n\n/, '')}
+                          text={msg.content.replace(/^📌 \*\*New Query[^\n]*\*\*\n\n/, '')}
                           isMe={isMe}
                         />
                       </p>
@@ -2199,7 +1617,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
           <div className="mb-2 p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 animate-in fade-in duration-150">
             <div>
               <span className="font-semibold block">{recordingError}</span>
-              <span className="text-[11px] text-amber-700">You can upload an audio note or send a test audio memo.</span>
+              <span className="text-[11px] text-amber-700">You can upload an audio note instead.</span>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
               <label className="px-2.5 py-1 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg text-[11px] font-bold text-amber-900 cursor-pointer shadow-xs inline-flex items-center gap-1">
@@ -2214,20 +1632,26 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
               </label>
               <button
                 type="button"
-                onClick={handleSendTestVoiceNote}
-                className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-bold shadow-xs cursor-pointer inline-flex items-center gap-1"
-              >
-                <Sparkles className="w-3 h-3" />
-                <span>Send Test Note</span>
-              </button>
-              <button
-                type="button"
                 onClick={() => setRecordingError(null)}
                 className="text-amber-500 hover:text-amber-800 p-1 cursor-pointer"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
             </div>
+          </div>
+        )}
+
+        {actionError && (
+          <div className="mb-2 p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-2 animate-in fade-in duration-150">
+            <span className="font-semibold">{actionError}</span>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              className="text-rose-400 hover:text-rose-700 p-1 cursor-pointer shrink-0"
+              aria-label="Dismiss"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
           </div>
         )}
 
@@ -2499,6 +1923,9 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                             </>
                           )}
                         </button>
+                        {ratingError && (
+                          <p className="text-[11px] font-semibold text-rose-700 text-center">{ratingError}</p>
+                        )}
                       </div>
                     )}
 
@@ -2964,6 +2391,9 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                     {reassigning ? 'Reassigning...' : 'Confirm Reassign'}
                   </button>
                 </div>
+                {reassignError && (
+                  <p className="text-[11px] font-semibold text-rose-700">{reassignError}</p>
+                )}
               </div>
             )}
           </div>
@@ -2979,8 +2409,9 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
           userProfile={userProfile}
           counselorName={counterpartyName}
           counselorId={currentTicket.expertId || currentTicket.assignedAdminId}
-          onSuccessSubmitted={() => {
-            // Updated via real-time onSnapshot
+          onSuccessSubmitted={(treat) => {
+            if (treat) setExistingCoffeeTreat(treat);
+            else loadCoffeeTreat(currentTicket.id);
           }}
         />
       )}
@@ -2996,7 +2427,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
                 </div>
                 <div>
                   <h3 className="text-sm font-bold text-slate-900">Coffee Treat Details</h3>
-                  <p className="text-[11px] text-slate-500">JazzCash Payment Proof</p>
+                  <p className="text-[11px] text-slate-500">{existingCoffeeTreat.paymentMethod || 'Payment'} Proof</p>
                 </div>
               </div>
               <button
@@ -3025,7 +2456,10 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
               <div className="flex justify-between text-slate-600">
                 <span>Account & Method:</span>
                 <span className="font-mono text-slate-800 font-semibold">
-                  03087144168 (Hamza Saif - {existingCoffeeTreat.paymentMethod || 'JazzCash / EasyPaisa / SadaPay'})
+                  {existingCoffeeTreat.accountNumber}
+                  {existingCoffeeTreat.accountTitle || existingCoffeeTreat.paymentMethod
+                    ? ` (${[existingCoffeeTreat.accountTitle, existingCoffeeTreat.paymentMethod].filter(Boolean).join(' - ')})`
+                    : ''}
                 </span>
               </div>
               <div className="flex justify-between text-slate-600">
@@ -3045,7 +2479,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({
             {existingCoffeeTreat.screenshotUrl && (
               <div className="space-y-1.5">
                 <span className="text-xs font-bold text-slate-700 block">
-                  JazzCash Transaction Screenshot:
+                  {existingCoffeeTreat.paymentMethod || 'Payment'} Transaction Screenshot:
                 </span>
                 <div className="rounded-2xl overflow-hidden border-2 border-slate-200 bg-slate-900 max-h-72 flex items-center justify-center p-1">
                   <img

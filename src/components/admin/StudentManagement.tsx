@@ -1,14 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-  updateDoc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState, useMemo } from 'react';
+import { api, errorMessage } from '../../lib/api';
+import { useApiResource, useLiveQueries } from '../../lib/liveData';
 import { useAuth } from '../../context/AuthContext';
 import { UserProfile, QueryTicket } from '../../types';
 import { ConversationView } from '../common/ConversationView';
@@ -38,13 +30,19 @@ export const StudentManagement: React.FC = () => {
   const canManagePasswords =
     userProfile?.role === 'super_admin' || userProfile?.role === 'expert_admin';
 
-  const [students, setStudents] = useState<UserProfile[]>([]);
-  const [queries, setQueries] = useState<QueryTicket[]>([]);
+  const { data: rawStudents, loading } = useApiResource<UserProfile[]>('/admin/students', ['users'], []);
+  const students = useMemo(
+    () => [...rawStudents].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)),
+    [rawStudents]
+  );
+  // All tickets, to count and list each student's queries.
+  const { queries } = useLiveQueries({ scope: 'all' });
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedStudent, setSelectedStudent] = useState<UserProfile | null>(null);
   const [inspectedTicket, setInspectedTicket] = useState<QueryTicket | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [statusUpdating, setStatusUpdating] = useState(false);
 
   // Student Password Change State
   const [passwordStudent, setPasswordStudent] = useState<UserProfile | null>(null);
@@ -57,41 +55,6 @@ export const StudentManagement: React.FC = () => {
   // Pagination
   const [currentPage, setCurrentPage] = useState(1);
   const pageSize = 10;
-
-  // Listen to students
-  useEffect(() => {
-    const q = query(collection(db, 'users'), where('role', '==', 'student'));
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: UserProfile[] = [];
-        snapshot.forEach((d) => {
-          list.push({ uid: d.id, ...d.data() } as UserProfile);
-        });
-        list.sort((a, b) => b.createdAt - a.createdAt);
-        setStudents(list);
-        setLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'users');
-      }
-    );
-
-    // Listen to all queries to calculate student totals
-    const qQueries = query(collection(db, 'queries'));
-    const unsubQueries = onSnapshot(qQueries, (snapshot) => {
-      const list: QueryTicket[] = [];
-      snapshot.forEach((d) => {
-        list.push({ id: d.id, ...d.data() } as QueryTicket);
-      });
-      setQueries(list);
-    });
-
-    return () => {
-      unsub();
-      unsubQueries();
-    };
-  }, []);
 
   // Calculate "New Students This Month" based on actual timestamps
   const startOfMonth = new Date();
@@ -111,13 +74,19 @@ export const StudentManagement: React.FC = () => {
   const paginatedStudents = filteredStudents.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const toggleStudentStatus = async (student: UserProfile) => {
-    const newStatus = student.status === 'active' ? 'deactivated' : 'active';
+    const newStatus = (student.status || 'active') === 'active' ? 'deactivated' : 'active';
+    setStatusError(null);
+    setStatusUpdating(true);
     try {
-      const ref = doc(db, 'users', student.uid);
-      await updateDoc(ref, { status: newStatus });
-      setSelectedStudent((prev) => (prev ? { ...prev, status: newStatus } : null));
+      const { profile } = await api.patch<{ profile: UserProfile }>(
+        `/admin/users/${encodeURIComponent(student.uid)}/status`,
+        { status: newStatus }
+      );
+      setSelectedStudent((prev) => (prev && prev.uid === student.uid ? { ...prev, ...profile, status: newStatus } : prev));
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${student.uid}`);
+      setStatusError(errorMessage(err, 'Could not update the account status.'));
+    } finally {
+      setStatusUpdating(false);
     }
   };
 
@@ -127,36 +96,27 @@ export const StudentManagement: React.FC = () => {
     setPasswordError(null);
     setPasswordSuccess(null);
 
-    if (newStudentPassword.length < 6) {
-      setPasswordError('Password must be at least 6 characters.');
+    if (newStudentPassword.length < 8) {
+      setPasswordError('Password must be at least 8 characters.');
       return;
     }
 
     setPasswordLoading(true);
     try {
-      const res = await fetch('/api/admin/update-user-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callerUid: userProfile.uid,
-          targetUid: passwordStudent.uid,
-          newPassword: newStudentPassword,
-        }),
+      await api.put(`/admin/users/${encodeURIComponent(passwordStudent.uid)}/password`, {
+        newPassword: newStudentPassword,
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to update student password.');
-      }
-
-      setPasswordSuccess(`Password updated successfully for ${passwordStudent.displayName}!`);
+      setPasswordSuccess(
+        `Password updated for ${passwordStudent.displayName}. They have been signed out and must change it at their next sign-in.`
+      );
       setTimeout(() => {
         setPasswordStudent(null);
         setNewStudentPassword('');
         setPasswordSuccess(null);
-      }, 1500);
-    } catch (err: any) {
-      setPasswordError(err.message || 'Error updating student password.');
+      }, 2500);
+    } catch (err) {
+      setPasswordError(errorMessage(err, 'Error updating student password.'));
     } finally {
       setPasswordLoading(false);
     }
@@ -312,7 +272,7 @@ export const StudentManagement: React.FC = () => {
                               : 'bg-rose-50 text-rose-700'
                           }`}
                         >
-                          {st.status.toUpperCase()}
+                          {(st.status || 'active').toUpperCase()}
                         </span>
                       </td>
 
@@ -393,7 +353,7 @@ export const StudentManagement: React.FC = () => {
                           : 'bg-rose-50 text-rose-700'
                       }`}
                     >
-                      {st.status.toUpperCase()}
+                      {(st.status || 'active').toUpperCase()}
                     </span>
                   </div>
 
@@ -529,7 +489,7 @@ export const StudentManagement: React.FC = () => {
               <div>
                 <span className="text-slate-600 font-medium">Account Status: </span>
                 <span className={`font-bold ${selectedStudent.status === 'active' ? 'text-emerald-600' : 'text-rose-600'}`}>
-                  {selectedStudent.status.toUpperCase()}
+                  {(selectedStudent.status || 'active').toUpperCase()}
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -550,7 +510,8 @@ export const StudentManagement: React.FC = () => {
                 )}
                 <button
                   onClick={() => toggleStudentStatus(selectedStudent)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border ${
+                  disabled={statusUpdating}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border disabled:opacity-50 ${
                     selectedStudent.status === 'active'
                       ? 'border-rose-200 text-rose-700 hover:bg-rose-50'
                       : 'border-emerald-200 text-emerald-700 hover:bg-emerald-50'
@@ -560,6 +521,13 @@ export const StudentManagement: React.FC = () => {
                 </button>
               </div>
             </div>
+
+            {statusError && (
+              <div className="mt-3 p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+                <span>{statusError}</span>
+              </div>
+            )}
 
             {/* Query History for this student */}
             <div className="mt-4">
@@ -587,7 +555,7 @@ export const StudentManagement: React.FC = () => {
                           <span className={`font-bold px-1.5 py-0.5 rounded text-[10px] ${
                             t.status === 'resolved' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
                           }`}>
-                            {t.status.toUpperCase()}
+                            {(t.status || 'open').toUpperCase()}
                           </span>
                         </div>
                         <h5 className="font-semibold text-slate-900">{t.title}</h5>
@@ -683,7 +651,7 @@ export const StudentManagement: React.FC = () => {
                     required
                     value={newStudentPassword}
                     onChange={(e) => setNewStudentPassword(e.target.value)}
-                    placeholder="Enter new student password (min. 6 chars)"
+                    placeholder="Enter new student password (min. 8 chars)"
                     className="w-full pl-9 pr-10 py-2 border border-slate-300 rounded-lg text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
                   />
                   <button
@@ -695,7 +663,7 @@ export const StudentManagement: React.FC = () => {
                   </button>
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
-                  The student can immediately sign in with this new password without needing reset emails.
+                  The student is signed out everywhere and must choose a new password the next time they sign in with this one.
                 </p>
               </div>
 

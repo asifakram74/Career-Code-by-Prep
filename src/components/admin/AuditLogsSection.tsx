@@ -1,34 +1,37 @@
-import React, { useState, useEffect } from 'react';
-import { collection, query, onSnapshot, orderBy } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState, useEffect, useCallback } from 'react';
+import { api, errorMessage } from '../../lib/api';
 import { AuditLogItem } from '../../types';
-import { Activity, ShieldCheck, Search, Clock } from 'lucide-react';
+import { Activity, ShieldCheck, Search, Clock, RefreshCw } from 'lucide-react';
+
+const REFRESH_INTERVAL_MS = 30_000;
 
 export const AuditLogsSection: React.FC = () => {
   const [logs, setLogs] = useState<AuditLogItem[]>([]);
   const [search, setSearch] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
-  useEffect(() => {
-    const q = query(collection(db, 'auditLogs'), orderBy('timestamp', 'desc'));
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: AuditLogItem[] = [];
-        snapshot.forEach((d) => {
-          list.push({ id: d.id, ...d.data() } as AuditLogItem);
-        });
-        setLogs(list);
-      },
-      (error) => {
-        // If empty or non-existent
-      }
-    );
-    return () => unsub();
+  const loadLogs = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const list = await api.get<AuditLogItem[]>('/admin/audit-logs');
+      setLogs(list);
+      setError(null);
+    } catch (err) {
+      setError(errorMessage(err, 'Could not load audit logs.'));
+    } finally {
+      setRefreshing(false);
+    }
   }, []);
 
+  useEffect(() => {
+    loadLogs();
+    const timer = window.setInterval(loadLogs, REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [loadLogs]);
+
   const filteredLogs = logs.filter((l) => {
-    const text = `${l.actorName} ${l.actorRole} ${l.action} ${l.details}`.toLowerCase();
+    const text = `${l.actorName} ${l.actorRole} ${l.action} ${l.details || ''}`.toLowerCase();
     return text.includes(search.toLowerCase());
   });
 
@@ -47,17 +50,32 @@ export const AuditLogsSection: React.FC = () => {
           </p>
         </div>
 
-        <div className="relative w-full sm:w-64">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search audit trail..."
-            className="w-full pl-9 pr-3 py-1.5 border border-slate-300 rounded-xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent"
-          />
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <div className="relative w-full sm:w-64">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search audit trail..."
+              className="w-full pl-9 pr-3 py-1.5 border border-slate-300 rounded-xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={loadLogs}
+            disabled={refreshing}
+            title="Refresh audit logs"
+            className="p-2 border border-slate-300 rounded-xl text-slate-500 hover:text-pink-600 hover:border-pink-300 disabled:opacity-50 cursor-pointer"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          </button>
         </div>
       </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl px-4 py-2.5">{error}</div>
+      )}
 
       <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
         <div className="overflow-x-auto">

@@ -93,9 +93,21 @@ function toItem(f: ApiFile, parentId: string) {
 // Config (settings table)
 // ---------------------------------------------------------------------------
 
+/** Saved config, else the GOOGLE_DRIVE_ROOT_FOLDER_ID default, else null. */
 async function getConfig(): Promise<DriveConfig | null> {
   const [row] = await db.select().from(t.settings).where(eq(t.settings.key, 'drive_config')).limit(1);
-  return (row?.value as DriveConfig) ?? null;
+  const saved = row?.value as DriveConfig | undefined;
+  if (saved?.rootFolderId && DRIVE_ID.test(saved.rootFolderId)) return saved;
+  if (config.googleDriveRootFolderId) {
+    return {
+      rootFolderId: config.googleDriveRootFolderId,
+      rootFolderName: 'Career Code Drive',
+      rootFolderUrl: `https://drive.google.com/drive/folders/${config.googleDriveRootFolderId}`,
+      lastSyncedAt: Date.now(),
+      syncStatus: 'idle',
+    };
+  }
+  return null;
 }
 
 export function extractFolderId(input: string): string | null {

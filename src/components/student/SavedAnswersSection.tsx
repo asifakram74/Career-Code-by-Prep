@@ -1,14 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  deleteDoc,
-  doc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import { api, errorMessage } from '../../lib/api';
+import { onReconnect, onSocket } from '../../lib/socket';
 import { useAuth } from '../../context/AuthContext';
 import { SavedAnswerItem } from '../../types';
 import {
@@ -34,43 +26,54 @@ export const SavedAnswersSection: React.FC<SavedAnswersSectionProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
 
+  const uid = userProfile?.uid;
+
   useEffect(() => {
-    if (!userProfile) return;
+    if (!uid) return;
+    let cancelled = false;
+    const sortItems = (list: SavedAnswerItem[]) => [...list].sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
 
-    const q = query(
-      collection(db, 'savedAnswers'),
-      where('studentId', '==', userProfile.uid)
-    );
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const items: SavedAnswerItem[] = [];
-        snapshot.forEach((d) => {
-          items.push({ id: d.id, ...d.data() } as SavedAnswerItem);
+    const load = () =>
+      api
+        .get<SavedAnswerItem[]>('/saved-answers')
+        .then((items) => {
+          if (!cancelled) setSavedAnswers(sortItems(items));
+        })
+        .catch((err) => console.error('Failed to load saved answers:', errorMessage(err)))
+        .finally(() => {
+          if (!cancelled) setLoading(false);
         });
-        items.sort((a, b) => b.savedAt - a.savedAt);
-        setSavedAnswers(items);
-        setLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'savedAnswers');
-      }
-    );
+    load();
 
-    return () => unsubscribe();
-  }, [userProfile]);
+    const offUpsert = onSocket<SavedAnswerItem>('saved-answer:upsert', (item) => {
+      if (item.studentId && item.studentId !== uid) return;
+      setSavedAnswers((prev) => sortItems([item, ...prev.filter((x) => x.id !== item.id)]));
+    });
+    const offDeleted = onSocket<{ id: string }>('saved-answer:deleted', ({ id }) => {
+      setSavedAnswers((prev) => prev.filter((x) => x.id !== id));
+    });
+    const offReconnect = onReconnect(load);
+
+    return () => {
+      cancelled = true;
+      offUpsert();
+      offDeleted();
+      offReconnect();
+    };
+  }, [uid]);
 
   const handleRemove = async (id: string) => {
     try {
-      await deleteDoc(doc(db, 'savedAnswers', id));
+      await api.del(`/saved-answers/${id}`);
+      setSavedAnswers((prev) => prev.filter((x) => x.id !== id));
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `savedAnswers/${id}`);
+      console.error('Failed to remove saved answer:', errorMessage(err));
+      alert(errorMessage(err, 'Could not remove the saved answer. Please try again.'));
     }
   };
 
   const filteredAnswers = savedAnswers.filter((item) => {
-    const text = `${item.queryTitle} ${item.categoryName} ${item.expertName} ${item.answerText}`.toLowerCase();
+    const text = `${item.queryTitle || ''} ${item.categoryName || ''} ${item.expertName || ''} ${item.answerText || ''}`.toLowerCase();
     return text.includes(searchQuery.toLowerCase());
   });
 

@@ -1,16 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  addDoc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { QueryTicket } from '../../types';
-import { offlineStorage } from '../../lib/offlineStorage';
+import { QueryTicket, SavedAnswerItem } from '../../types';
+import { api, errorMessage } from '../../lib/api';
+import { useLiveQueries } from '../../lib/liveData';
+import { onReconnect, onSocket } from '../../lib/socket';
 import { CustomSelect } from '../common/CustomSelect';
 import {
   Calendar,
@@ -35,74 +28,47 @@ export const HistorySection: React.FC<HistorySectionProps> = ({
   onNavigateTab,
 }) => {
   const { userProfile } = useAuth();
-  const [tickets, setTickets] = useState<QueryTicket[]>([]);
-  const [savedQueryIds, setSavedQueryIds] = useState<string[]>([]);
+  const uid = userProfile?.uid;
+  const { queries } = useLiveQueries({
+    enabled: Boolean(uid),
+    filter: (q) => q.studentId === uid,
+  });
+  // History is ordered by submission date, newest first
+  const tickets = useMemo(
+    () => [...queries].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)),
+    [queries]
+  );
+  const [savedAnswers, setSavedAnswers] = useState<{ id: string; queryId: string }[]>([]);
+  const savedQueryIds = useMemo(() => savedAnswers.map((s) => s.queryId), [savedAnswers]);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
-  const [loading, setLoading] = useState(true);
+
+  // Saved answers, to show bookmark status
   useEffect(() => {
-    if (!userProfile) return;
-
-    // Load initial cached tickets immediately
-    const cached = offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
-    if (cached && cached.length > 0) {
-      setTickets(cached);
-      setLoading(false);
-    }
-
-    // Load queries for this student
-    const q = query(
-      collection(db, 'queries'),
-      where('studentId', '==', userProfile.uid)
-    );
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const items: QueryTicket[] = [];
-        snapshot.forEach((d) => {
-          items.push({ id: d.id, ...d.data() } as QueryTicket);
-        });
-        // Sort descending by created timestamp
-        items.sort((a, b) => b.createdAt - a.createdAt);
-        setTickets(items);
-        offlineStorage.set(`cc_student_queries_${userProfile.uid}`, items);
-        setLoading(false);
-      },
-      (error) => {
-        const cachedFallback = offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
-        if (cachedFallback && cachedFallback.length > 0) {
-          setTickets(cachedFallback);
-        }
-        setLoading(false);
-        handleFirestoreError(error, OperationType.LIST, 'queries');
-      }
-    );
-
-    // Also check saved answers to show bookmark status
-    const savedQ = query(
-      collection(db, 'savedAnswers'),
-      where('studentId', '==', userProfile.uid)
-    );
-    const unsubSaved = onSnapshot(
-      savedQ,
-      (snapshot) => {
-        const ids: string[] = [];
-        snapshot.forEach((d) => {
-          ids.push(d.data().queryId);
-        });
-        setSavedQueryIds(ids);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'savedAnswers');
-      }
-    );
-
+    if (!uid) return;
+    let cancelled = false;
+    const load = () =>
+      api
+        .get<SavedAnswerItem[]>('/saved-answers')
+        .then((items) => {
+          if (!cancelled) setSavedAnswers(items.map((i) => ({ id: i.id, queryId: i.queryId })));
+        })
+        .catch((err) => console.error('Failed to load saved answers:', errorMessage(err)));
+    load();
+    const offUpsert = onSocket<SavedAnswerItem>('saved-answer:upsert', (item) => {
+      setSavedAnswers((prev) => [...prev.filter((x) => x.id !== item.id), { id: item.id, queryId: item.queryId }]);
+    });
+    const offDeleted = onSocket<{ id: string }>('saved-answer:deleted', ({ id }) => {
+      setSavedAnswers((prev) => prev.filter((x) => x.id !== id));
+    });
+    const offReconnect = onReconnect(load);
     return () => {
-      unsubscribe();
-      unsubSaved();
+      cancelled = true;
+      offUpsert();
+      offDeleted();
+      offReconnect();
     };
-  }, [userProfile]);
+  }, [uid]);
 
   // Active non-deleted queries for this student (retained until student deletes them)
   const activeTickets = tickets.filter(
@@ -110,11 +76,12 @@ export const HistorySection: React.FC<HistorySectionProps> = ({
   );
 
   const filteredTickets = activeTickets.filter((t) => {
+    const needle = searchQuery.toLowerCase();
     const matchesSearch =
-      t.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      t.ticketNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      t.categoryName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      t.expertName.toLowerCase().includes(searchQuery.toLowerCase());
+      (t.title || '').toLowerCase().includes(needle) ||
+      (t.ticketNumber || '').toLowerCase().includes(needle) ||
+      (t.categoryName || '').toLowerCase().includes(needle) ||
+      (t.expertName || '').toLowerCase().includes(needle);
 
     if (!matchesSearch) return false;
     if (statusFilter !== 'all' && t.status !== statusFilter) return false;
@@ -125,19 +92,18 @@ export const HistorySection: React.FC<HistorySectionProps> = ({
     e.stopPropagation();
     if (!userProfile) return;
     try {
-      await addDoc(collection(db, 'savedAnswers'), {
-        studentId: userProfile.uid,
+      const item = await api.post<SavedAnswerItem>('/saved-answers', {
         queryId: ticket.id,
-        queryTitle: ticket.title,
-        categoryName: ticket.categoryName,
-        expertName: ticket.expertName,
-        questionText: ticket.detail,
+        queryTitle: ticket.title || '',
+        categoryName: ticket.categoryName || '',
+        expertName: ticket.expertName || '',
+        questionText: ticket.detail || '',
         answerText: ticket.lastReplyPreview || 'Refer to conversation history.',
-        savedAt: Date.now(),
       });
-      setSavedQueryIds((prev) => [...prev, ticket.id]);
+      setSavedAnswers((prev) => [...prev.filter((x) => x.id !== item.id), { id: item.id, queryId: item.queryId }]);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'savedAnswers');
+      console.error('Failed to save answer:', errorMessage(err));
+      alert(errorMessage(err, 'Could not save this answer. Please try again.'));
     }
   };
 
@@ -234,7 +200,7 @@ export const HistorySection: React.FC<HistorySectionProps> = ({
                           : 'bg-amber-50 text-amber-700'
                       }`}
                     >
-                      {t.status.replace('_', ' ').toUpperCase()}
+                      {(t.status || '').replace('_', ' ').toUpperCase()}
                     </span>
 
                     <button

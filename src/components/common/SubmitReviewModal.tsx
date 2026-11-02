@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { collection, addDoc, getDocs } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
+import { api, errorMessage } from '../../lib/api';
 import { useAuth } from '../../context/AuthContext';
 import { QUALIFICATION_OPTIONS } from '../../types';
 import {
@@ -68,6 +67,7 @@ export const SubmitReviewModal: React.FC<SubmitReviewModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string>('');
   const [submittedSuccessfully, setSubmittedSuccessfully] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState(false);
 
   // References for scrolling and focus
   const formScrollRef = useRef<HTMLDivElement>(null);
@@ -176,66 +176,23 @@ export const SubmitReviewModal: React.FC<SubmitReviewModalProps> = ({
     setIsSubmitting(true);
 
     try {
-      const now = Date.now();
-
-      // 1. Create record in platform_reviews without any undefined fields
-      await addDoc(collection(db, 'platform_reviews'), {
-        studentId: userProfile?.uid || 'guest_visitor',
+      // The server fills in the account details, notifies super admins, and
+      // holds guests' reviews for approval (pending: true).
+      const res = await api.post<{ pending?: boolean }>('/platform-reviews', {
         studentName: trimmedName,
-        studentEmail: userProfile?.email || '',
         studentQualification: qualification,
         studentBoard: boardOrCity.trim() || '',
-        studentAvatarUrl: userProfile?.photoURL || '',
         rating,
         ratingFeedback: trimmedFeedback,
         ratingTags: selectedTags,
-        categoryName: 'Career Code LMS',
-        expertName: 'Career Code Mentors',
-        status: 'active',
-        createdAt: now,
       });
 
-      // 2. Notify Super Admin (Hamza Saif) in real time
-      try {
-        const usersSnap = await getDocs(collection(db, 'users'));
-        const notifiedUserIds = new Set<string>();
-
-        usersSnap.forEach((uDoc) => {
-          const u = uDoc.data();
-          const isSuperAdmin = u.role === 'super_admin';
-          const isHamzaSaif =
-            uDoc.id === 'admin_hamza_saif' ||
-            (u.displayName || '').toLowerCase().includes('hamza saif') ||
-            u.email === 'mentoflux@gmail.com';
-
-          if ((isSuperAdmin || isHamzaSaif) && !notifiedUserIds.has(uDoc.id)) {
-            notifiedUserIds.add(uDoc.id);
-          }
-        });
-
-        if (notifiedUserIds.size === 0) {
-          notifiedUserIds.add('admin_hamza_saif');
-        }
-
-        for (const adminUid of notifiedUserIds) {
-          await addDoc(collection(db, 'notifications'), {
-            userId: adminUid,
-            title: `⭐ New Review for Career Code!`,
-            message: `${trimmedName} (${qualification}) submitted a ${rating}-star review: "${trimmedFeedback.slice(0, 100)}${trimmedFeedback.length > 100 ? '...' : ''}"`,
-            type: 'platform_review',
-            isRead: false,
-            createdAt: now,
-          });
-        }
-      } catch (notifErr) {
-        console.warn('Super admin notification error:', notifErr);
-      }
-
+      setPendingApproval(Boolean(res?.pending));
       setSubmittedSuccessfully(true);
       if (onSuccess) onSuccess();
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error submitting platform review:', err);
-      setError(err?.message || 'Failed to submit review. Please try again.');
+      setError(errorMessage(err, 'Failed to submit review. Please try again.'));
       scrollToFirstMissingField();
     } finally {
       setIsSubmitting(false);
@@ -297,7 +254,9 @@ export const SubmitReviewModal: React.FC<SubmitReviewModalProps> = ({
                 Thank You for Your Feedback!
               </h3>
               <p className="text-xs sm:text-sm text-slate-600 max-w-sm mx-auto leading-relaxed">
-                Your genuine review has been recorded and will inspire thousands of students seeking reliable career guidance across Pakistan.
+                {pendingApproval
+                  ? 'Your review has been received and will appear on the site once our team approves it.'
+                  : 'Your genuine review has been recorded and will inspire thousands of students seeking reliable career guidance across Pakistan.'}
               </p>
             </div>
 

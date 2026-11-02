@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
-import { doc, updateDoc } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
 import { useAuth } from '../../context/AuthContext';
+import { api, errorMessage, uploadFile } from '../../lib/api';
+import { ChangePasswordModal } from './ChangePasswordModal';
 import { QUALIFICATION_OPTIONS, BOARD_OPTIONS, formatRoleName } from '../../types';
 import { CustomSelect } from './CustomSelect';
 import {
@@ -14,6 +13,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Save,
+  KeyRound,
 } from 'lucide-react';
 
 export const UserProfileSection: React.FC = () => {
@@ -27,6 +27,9 @@ export const UserProfileSection: React.FC = () => {
   const [professionalTitle, setProfessionalTitle] = useState(userProfile?.professionalTitle || '');
   const [shortDescription, setShortDescription] = useState(userProfile?.shortDescription || '');
   const [photoURL, setPhotoURL] = useState(userProfile?.photoURL || '');
+  // Compressed image waiting to be uploaded on save (photoURL holds its preview).
+  const [pendingPhoto, setPendingPhoto] = useState<Blob | null>(null);
+  const [showChangePassword, setShowChangePassword] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
@@ -67,7 +70,18 @@ export const UserProfileSection: React.FC = () => {
         const ctx = canvas.getContext('2d');
         ctx?.drawImage(img, 0, 0, width, height);
         const compressedBase64 = canvas.toDataURL('image/jpeg', 0.85);
-        setPhotoURL(compressedBase64);
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              setError('Could not process this image. Please try another one.');
+              return;
+            }
+            setPendingPhoto(blob);
+            setPhotoURL(compressedBase64);
+          },
+          'image/jpeg',
+          0.85
+        );
       };
       img.src = event.target?.result as string;
     };
@@ -82,13 +96,18 @@ export const UserProfileSection: React.FC = () => {
     setSuccess(false);
 
     try {
-      const userRef = doc(db, 'users', userProfile.uid);
-      const payload: any = {
+      const payload: Record<string, string> = {
         displayName: displayName.trim(),
         phoneNumber: phoneNumber.trim(),
-        photoURL: photoURL || '',
-        lastActiveAt: Date.now(),
       };
+
+      // Upload a newly picked photo first, then save its URL.
+      if (pendingPhoto) {
+        const uploadedUrl = await uploadFile({ blob: pendingPhoto, name: 'profile-photo.jpg' });
+        payload.photoURL = uploadedUrl;
+      } else if (photoURL !== (userProfile.photoURL || '')) {
+        payload.photoURL = photoURL || '';
+      }
 
       if (isStudent) {
         payload.qualification = qualification;
@@ -99,12 +118,15 @@ export const UserProfileSection: React.FC = () => {
         payload.shortDescription = shortDescription.trim();
       }
 
-      await updateDoc(userRef, payload);
+      await api.patch('/users/me', payload);
+      if (payload.photoURL !== undefined) {
+        setPhotoURL(payload.photoURL);
+        setPendingPhoto(null);
+      }
       await refreshProfile();
       setSuccess(true);
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${userProfile.uid}`);
-      setError(err.message || 'Failed to update profile.');
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to update profile.'));
     } finally {
       setSaving(false);
     }
@@ -268,7 +290,15 @@ export const UserProfileSection: React.FC = () => {
           </>
         )}
 
-        <div className="pt-4 border-t border-slate-100 flex justify-end">
+        <div className="pt-4 border-t border-slate-100 flex flex-wrap justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setShowChangePassword(true)}
+            className="px-4 py-2.5 border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-xl font-semibold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer text-xs"
+          >
+            <KeyRound className="w-4 h-4" />
+            Change Password
+          </button>
           <button
             type="submit"
             disabled={saving}
@@ -279,6 +309,8 @@ export const UserProfileSection: React.FC = () => {
           </button>
         </div>
       </form>
+
+      {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} />}
     </div>
   );
 };

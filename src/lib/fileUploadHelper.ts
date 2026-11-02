@@ -1,8 +1,10 @@
 /**
  * File upload, image compression, and progress helper.
- * Ensures images and media attachments are optimized to fit securely
- * within Firestore limits while preserving high visual readability (e.g. for marksheets, transcripts, notices).
+ * Images are compressed in the browser before upload to keep transfers small
+ * while preserving readability (e.g. for marksheets, transcripts, notices).
  */
+import type { AttachmentItem } from '../types';
+import { uploadFiles } from './api';
 
 export interface ProcessedAttachment {
   id: string;
@@ -130,6 +132,29 @@ export async function readFileDataUrl(
 
     reader.readAsDataURL(file);
   });
+}
+
+/** Converts a data URL (e.g. from compressImage or a recorder) into a Blob for upload. */
+export async function dataUrlToBlob(dataUrl: string): Promise<Blob> {
+  return (await fetch(dataUrl)).blob();
+}
+
+/**
+ * Uploads attachments prepared in the browser (compressed images, PDFs, recorded
+ * audio as data URLs) and returns server attachment records with /api/files URLs.
+ */
+export async function uploadDataUrls(
+  items: { dataUrl: string; name: string }[]
+): Promise<AttachmentItem[]> {
+  if (!items.length) return [];
+  const blobs = await Promise.all(items.map(async (i) => ({ blob: await dataUrlToBlob(i.dataUrl), name: i.name })));
+  return uploadFiles(blobs);
+}
+
+/** Uploads one data URL (e.g. a voice note) and returns its /api/files URL. */
+export async function uploadDataUrl(dataUrl: string, name: string): Promise<string> {
+  const [item] = await uploadDataUrls([{ dataUrl, name }]);
+  return item.url;
 }
 
 /**

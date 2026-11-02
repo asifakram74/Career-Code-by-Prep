@@ -1,15 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { QueryTicket, CategoryItem, UserProfile, formatRoleName } from '../../types';
+import { QueryTicket, CategoryItem, formatRoleName } from '../../types';
+import { useLiveQueries, useApiResource } from '../../lib/liveData';
 import { sortCategoriesGeneralFirst } from '../../constants/officialCategories';
 import {
   LayoutDashboard,
@@ -38,101 +30,19 @@ export const AdminAnalyticsDashboard: React.FC<AdminAnalyticsDashboardProps> = (
   onOpenTicket,
 }) => {
   const { userProfile } = useAuth();
-  const [liveProfile, setLiveProfile] = useState<UserProfile | null>(userProfile);
-  const [assignedTickets, setAssignedTickets] = useState<QueryTicket[]>([]);
-  const [allCategories, setAllCategories] = useState<CategoryItem[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  // Sync live profile in real-time to immediately reflect categories allotted by Super Admin
-  useEffect(() => {
-    if (!userProfile?.uid) return;
-    setLiveProfile(userProfile);
-
-    const unsubUser = onSnapshot(
-      doc(db, 'users', userProfile.uid),
-      (snap) => {
-        if (snap.exists()) {
-          setLiveProfile({ ...(snap.data() as UserProfile), uid: userProfile.uid });
-        }
-      },
-      (err) => {
-        console.warn('Admin profile listener warning:', err);
-      }
-    );
-
-    return () => unsubUser();
-  }, [userProfile?.uid]);
-
-  // Real-time listener for queries assigned to this specific admin (resilient matching)
-  useEffect(() => {
-    if (!userProfile) return;
-
-    const myUid = (userProfile.uid || '').toLowerCase().trim();
-    const myEmail = (userProfile.email || '').toLowerCase().trim();
-
-    const qQueries = query(collection(db, 'queries'));
-
-    const unsubQueries = onSnapshot(
-      qQueries,
-      (snapshot) => {
-        const items: QueryTicket[] = [];
-        snapshot.forEach((d) => {
-          const t = { id: d.id, ...d.data() } as QueryTicket;
-          const expId = (t.expertId || '').toLowerCase().trim();
-          const expEmail = (t.expertEmail || '').toLowerCase().trim();
-
-          const isAssignedToMe =
-            (myUid && expId === myUid) ||
-            (myEmail && expId === myEmail) ||
-            (myEmail && expEmail === myEmail) ||
-            (t.assignmentStatus === 'unassigned' &&
-              Array.isArray(liveProfile?.assignedCategories) &&
-              liveProfile.assignedCategories.includes(t.categoryId));
-
-          if (isAssignedToMe) {
-            items.push(t);
-          }
-        });
-        items.sort((a, b) => (b.lastReplyAt || b.createdAt) - (a.lastReplyAt || a.createdAt));
-        setAssignedTickets(items);
-        setLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'queries');
-      }
-    );
-
-    // Real-time listener for categories
-    const qCats = query(collection(db, 'categories'));
-    const unsubCats = onSnapshot(
-      qCats,
-      (snapshot) => {
-        const cats: CategoryItem[] = [];
-        snapshot.forEach((d) => {
-          const data = d.data();
-          cats.push({
-            id: d.id,
-            name: data.name || 'Untitled Category',
-            description: data.description || '',
-            assignedAdminIds: Array.isArray(data.assignedAdminIds) ? data.assignedAdminIds : [],
-            primaryAdminId: data.primaryAdminId,
-            status: data.status === 'inactive' ? 'inactive' : 'active',
-            createdAt: data.createdAt || 0,
-            updatedAt: data.updatedAt || 0,
-          });
-        });
-        setAllCategories(sortCategoriesGeneralFirst(cats));
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'categories');
-      }
-    );
-
-    return () => {
-      unsubQueries();
-      unsubCats();
-    };
-  }, [userProfile, liveProfile?.assignedCategories]);
+  // userProfile is kept live by the socket (profile:update), so newly allotted
+  // categories show up without a separate listener.
+  const liveProfile = userProfile;
+  // Normal admins: assigned + claimable tickets in their categories; managers: assigned to them.
+  const myUidForFilter = userProfile?.uid || '';
+  const isManager = userProfile?.role === 'expert_admin' || userProfile?.role === 'super_admin';
+  const { queries: assignedTickets } = useLiveQueries({
+    enabled: Boolean(myUidForFilter),
+    // Managers receive pushes for every ticket; keep only the ones assigned to them.
+    filter: isManager ? (t) => t.expertId === myUidForFilter : undefined,
+  });
+  const { data: categoryList } = useApiResource<CategoryItem[]>('/categories', ['categories'], []);
+  const allCategories = useMemo(() => sortCategoriesGeneralFirst(categoryList), [categoryList]);
 
   // Analytics Computations
   // 1. Unique students this admin has counseled / dealt with

@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { collection, getDocs, query, where } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
+import { api } from '../../lib/api';
 import { PublicMentor } from '../../types/landing';
 import { LandingNavbar } from './LandingNavbar';
 import { HeroSection } from './HeroSection';
@@ -35,96 +34,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
     async function loadPublicMentors() {
       try {
-        // 1. Try secure public backend endpoint first
-        const res = await fetch('/api/public/mentors');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && Array.isArray(data.mentors) && data.mentors.length > 0) {
-            if (!isMounted) return;
-            const fetched: PublicMentor[] = data.mentors;
-            const f = fetched.find((m) => m.isFounder) || null;
-            setFounder(f);
-            setMentors(fetched);
-            setLoadingMentors(false);
-            return;
-          }
-        }
-      } catch (e) {
-        console.warn('Backend /api/public/mentors check failed, falling back to direct sanitized Firestore fetch', e);
-      }
-
-      // 2. Direct Firestore fallback (Always sanitized, never exposing passwords or sensitive fields)
-      try {
-        const usersSnap = await getDocs(
-          query(collection(db, 'users'), where('role', 'in', ['normal_admin', 'expert_admin', 'super_admin']))
-        );
-        const categoriesSnap = await getDocs(collection(db, 'categories'));
-
-        const categoryMap: Record<string, string> = {};
-        categoriesSnap.docs.forEach((d) => {
-          categoryMap[d.id] = d.data().name || d.id;
-        });
-
-        const list: PublicMentor[] = [];
-        usersSnap.docs.forEach((d) => {
-          const data = d.data();
-          if (data.status === 'deactivated' || data.isDeactivated === true) return;
-
-          const isFounder =
-            (data.displayName || '').toLowerCase().includes('huzaifa') || d.id === 'admin_huzaifa_khalil';
-
-          const catIds = Array.isArray(data.assignedCategories) ? data.assignedCategories : [];
-          const categories = catIds
-            .filter((cId: string) => cId !== 'cat-admissions' && cId !== 'cat-general-guidance' && Boolean(categoryMap[cId]))
-            .map((cId: string) => ({
-              id: cId,
-              name: categoryMap[cId],
-            }));
-
-          list.push({
-            uid: d.id,
-            displayName: data.displayName || 'Career Mentor',
-            professionalTitle: isFounder
-              ? 'Founder, Career Code'
-              : data.professionalTitle || 'Academic & Career Mentor',
-            shortDescription:
-              data.shortDescription ||
-              data.bio ||
-              'Experienced mentor helping Pakistani students explore university admissions and degrees.',
-            photoURL: data.photoURL || '',
-            role: data.role || 'normal_admin',
-            categories,
-            isFounder,
-            averageRating: typeof data.averageRating === 'number' ? data.averageRating : undefined,
-            ratingCount: typeof data.ratingCount === 'number' ? data.ratingCount : 0,
-          });
-        });
-
-        // Deduplicate by name, keeping founder / complete profiles
-        const seen = new Set<string>();
-        const deduped: PublicMentor[] = [];
-        list.sort((a, b) => {
-          if (a.isFounder && !b.isFounder) return -1;
-          if (!a.isFounder && b.isFounder) return 1;
-          if (a.photoURL && !b.photoURL) return -1;
-          if (!a.photoURL && b.photoURL) return 1;
-          return (a.displayName || '').localeCompare(b.displayName || '');
-        });
-
-        for (const item of list) {
-          const key = (item.displayName || '').trim().toLowerCase();
-          if (!seen.has(key)) {
-            seen.add(key);
-            deduped.push(item);
-          }
-        }
-
+        const data = await api.get<{ success: boolean; mentors: PublicMentor[] }>('/public/mentors');
         if (!isMounted) return;
-        const f = deduped.find((m) => m.isFounder) || null;
-        setFounder(f);
-        setMentors(deduped);
+        const fetched: PublicMentor[] = Array.isArray(data?.mentors) ? data.mentors : [];
+        setFounder(fetched.find((m) => m.isFounder) || null);
+        setMentors(fetched);
       } catch (err) {
-        console.error('Error fetching mentors from Firestore:', err);
+        console.warn('Could not load mentors:', err);
       } finally {
         if (isMounted) setLoadingMentors(false);
       }

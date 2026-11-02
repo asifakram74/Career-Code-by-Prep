@@ -220,17 +220,6 @@ export async function sendPushNotification(
       const registration = await getActiveSWRegistration();
       if (registration) {
         await registration.showNotification(title, notificationOptions as any);
-
-        // Also post message to active worker as an extra trigger
-        if (registration.active) {
-          try {
-            registration.active.postMessage({
-              type: 'SHOW_SYSTEM_NOTIFICATION',
-              title,
-              options: notificationOptions,
-            });
-          } catch {}
-        }
         return true;
       }
     }

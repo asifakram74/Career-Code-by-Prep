@@ -1,8 +1,0 @@
-{
-  "name": "Career Guide by Prep Titans",
-  "description": "Student career guidance platform connecting students with expert administrators across fields like CA, MBBS, Computer Science, and Engineering.",
-  "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
-}

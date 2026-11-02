@@ -16,4 +16,6 @@ export const config = {
   sessionTtlMs: 30 * 24 * 60 * 60 * 1000,
   sessionCookie: 'cc_session',
   googleDriveApiKey: process.env.GOOGLE_DRIVE_API_KEY || '',
+  // Used until a super admin saves a folder in the app.
+  googleDriveRootFolderId: process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || '',
 };

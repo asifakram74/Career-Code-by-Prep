@@ -1,21 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-  updateDoc,
-  arrayUnion,
-  getDocs,
-  deleteDoc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import { api, errorMessage } from '../../lib/api';
+import { useLiveQueries } from '../../lib/liveData';
 import { useAuth } from '../../context/AuthContext';
-import { QueryTicket } from '../../types';
+import { QueryTicket, SavedAnswerItem } from '../../types';
 import { ConversationView } from '../common/ConversationView';
-import { offlineStorage } from '../../lib/offlineStorage';
 import { navigationHistory } from '../../lib/navigationHistory';
 import {
   Search,
@@ -38,21 +26,20 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
   initialSelectedTicketId,
 }) => {
   const { userProfile } = useAuth();
-  const [tickets, setTickets] = useState<QueryTicket[]>(() => {
-    if (!userProfile?.uid) return [];
-    return offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
+  const uid = userProfile?.uid;
+  const {
+    queries: tickets,
+    setQueries: setTickets,
+    loading,
+  } = useLiveQueries({
+    enabled: Boolean(uid),
+    filter: (q) => q.studentId === uid,
   });
   const [activeTicket, setActiveTicket] = useState<QueryTicket | null>(null);
 
   // Exact 4 categories: 'all' | 'unread' | 'resolved' | 'unresolved'
   const [filter, setFilter] = useState<'all' | 'unread' | 'resolved' | 'unresolved'>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [loading, setLoading] = useState(() => {
-    if (!userProfile?.uid) return true;
-    const cached = offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
-    return cached.length === 0;
-  });
-
   // Delete for me state & long press tracking
   const [deleteModalTicket, setDeleteModalTicket] = useState<QueryTicket | null>(null);
   const [savedCountInTargetChat, setSavedCountInTargetChat] = useState<number>(0);
@@ -67,13 +54,8 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
     setCheckingSaved(true);
     setSavedCountInTargetChat(0);
     try {
-      const q = query(
-        collection(db, 'savedAnswers'),
-        where('studentId', '==', userProfile?.uid || ''),
-        where('queryId', '==', t.id)
-      );
-      const snap = await getDocs(q);
-      setSavedCountInTargetChat(snap.size);
+      const saved = await api.get<SavedAnswerItem[]>(`/saved-answers?queryId=${encodeURIComponent(t.id)}`);
+      setSavedCountInTargetChat(saved.length);
     } catch (e) {
       console.warn('Could not check saved answers:', e);
     } finally {
@@ -144,38 +126,10 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
     if (!deleteModalTicket || !userProfile) return;
     setDeletingForMe(true);
     try {
-      const ref = doc(db, 'queries', deleteModalTicket.id);
-      await updateDoc(ref, {
-        deletedForUsers: arrayUnion(userProfile.uid),
-      });
-
-      // If user had bookmarked answers in this query, remove them as requested
-      if (savedCountInTargetChat > 0) {
-        const q = query(
-          collection(db, 'savedAnswers'),
-          where('studentId', '==', userProfile.uid),
-          where('queryId', '==', deleteModalTicket.id)
-        );
-        const snap = await getDocs(q);
-        snap.forEach(async (d) => {
-          await deleteDoc(doc(db, 'savedAnswers', d.id)).catch(() => {});
-        });
-      }
-
-      // Also remove unread notifications for this user regarding this deleted chat
-      try {
-        const notifQ = query(
-          collection(db, 'notifications'),
-          where('userId', '==', userProfile.uid),
-          where('queryId', '==', deleteModalTicket.id)
-        );
-        const notifSnap = await getDocs(notifQ);
-        notifSnap.forEach(async (d) => {
-          await deleteDoc(doc(db, 'notifications', d.id)).catch(() => {});
-        });
-      } catch (err) {
-        console.warn('Error clearing notifications for deleted query:', err);
-      }
+      // Server hides the chat for me and also removes my saved answers + notifications for it
+      await api.post(`/queries/${deleteModalTicket.id}/hide`);
+      const hiddenId = deleteModalTicket.id;
+      setTickets((prev) => prev.filter((t) => t.id !== hiddenId));
 
       if (activeTicket?.id === deleteModalTicket.id) {
         setActiveTicket(null);
@@ -183,57 +137,31 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
       setDeleteModalTicket(null);
     } catch (e) {
       console.error('Delete for me error:', e);
+      alert(errorMessage(e, 'Could not delete this chat. Please try again.'));
     } finally {
       setDeletingForMe(false);
     }
   };
 
+  // Open the requested chat once, after the first load (or when a different chat is requested).
+  // The user stays on whichever chat they pick afterwards; nothing is auto-opened.
+  const appliedInitialIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!userProfile) return;
+    if (!uid || loading || !initialSelectedTicketId) return;
+    if (appliedInitialIdRef.current === initialSelectedTicketId) return;
+    appliedInitialIdRef.current = initialSelectedTicketId;
+    const match = tickets.find((t) => t.id === initialSelectedTicketId);
+    if (match) setActiveTicket(match);
+  }, [uid, loading, tickets, initialSelectedTicketId]);
 
-    const q = query(
-      collection(db, 'queries'),
-      where('studentId', '==', userProfile.uid)
-    );
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const items: QueryTicket[] = [];
-        snapshot.forEach((d) => {
-          items.push({ id: d.id, ...d.data() } as QueryTicket);
-        });
-        // Sort descending by last reply or creation timestamp
-        items.sort((a, b) => (b.lastReplyAt || b.createdAt) - (a.lastReplyAt || a.createdAt));
-        setTickets(items);
-        offlineStorage.set(`cc_student_queries_${userProfile.uid}`, items);
-
-        if (initialSelectedTicketId) {
-          const match = items.find((t) => t.id === initialSelectedTicketId);
-          if (match) setActiveTicket(match);
-        } else {
-          setActiveTicket((prev) => {
-            if (!prev) {
-              return typeof window !== 'undefined' && window.innerWidth >= 1280 && items.length > 0 ? items[0] : null;
-            }
-            const updated = items.find((t) => t.id === prev.id);
-            return updated || prev;
-          });
-        }
-        setLoading(false);
-      },
-      (error) => {
-        const cachedFallback = offlineStorage.get<QueryTicket[]>(`cc_student_queries_${userProfile.uid}`, []);
-        if (cachedFallback && cachedFallback.length > 0) {
-          setTickets(cachedFallback);
-        }
-        setLoading(false);
-        handleFirestoreError(error, OperationType.LIST, 'queries');
-      }
-    );
-
-    return () => unsubscribe();
-  }, [userProfile, initialSelectedTicketId]);
+  // Keep the open chat's ticket data current as updates arrive
+  useEffect(() => {
+    setActiveTicket((prev) => {
+      if (!prev) return prev;
+      const updated = tickets.find((t) => t.id === prev.id);
+      return updated || prev;
+    });
+  }, [tickets]);
 
   // Filter out any chats deleted for this user
   const activeUserTickets = tickets.filter(
@@ -246,7 +174,7 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
   const unresolvedCount = activeUserTickets.filter((t) => t.status !== 'resolved').length;
 
   const filteredTickets = activeUserTickets.filter((t) => {
-    const text = `${t.title} ${t.expertName} ${t.categoryName}`.toLowerCase();
+    const text = `${t.title || ''} ${t.expertName || ''} ${t.categoryName || ''}`.toLowerCase();
     if (searchQuery && !text.includes(searchQuery.toLowerCase())) return false;
 
     if (filter === 'unread') return t.hasUnreadStudentReply;
@@ -267,10 +195,9 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
     if (isToday) {
       return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     }
-    const isYesterday =
-      date.getDate() === now.getDate() - 1 &&
-      date.getMonth() === now.getMonth() &&
-      date.getFullYear() === now.getFullYear();
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    const isYesterday = date.toDateString() === yesterday.toDateString();
     if (isYesterday) return 'Yesterday';
     return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
   };
@@ -386,7 +313,7 @@ export const RepliesSection: React.FC<RepliesSectionProps> = ({
                 const isSelected = activeTicket?.id === t.id;
                 const isUnread = t.hasUnreadStudentReply;
                 const lastTime = formatWhatsAppTime(t.lastReplyAt || t.createdAt);
-                const rawSnippet = t.lastReplyPreview || t.detail;
+                const rawSnippet = t.lastReplyPreview || t.detail || '';
                 // Pure clean message snippet with NO ticket number!
                 const cleanSnippet = rawSnippet.replace(/^\[PT-[^\]]+\]:\s*/, '');
                 const isSystemNotice = cleanSnippet.startsWith('🔄') || cleanSnippet.startsWith('📌');

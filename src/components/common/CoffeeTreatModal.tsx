@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Coffee,
   X,
@@ -11,28 +11,36 @@ import {
   Heart,
   Loader2,
 } from 'lucide-react';
-import { collection, addDoc, getDocs } from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { QueryTicket, UserProfile } from '../../types';
-import { compressImage } from '../../lib/fileUploadHelper';
+import { CoffeeTreatItem, QueryTicket, UserProfile } from '../../types';
+import { api, errorMessage } from '../../lib/api';
+import { compressImage, uploadDataUrl } from '../../lib/fileUploadHelper';
 
 interface CoffeeTreatModalProps {
   isOpen: boolean;
   onClose: () => void;
   ticket: QueryTicket;
-  userProfile: UserProfile | null;
+  /** Kept for compatibility; the server takes the student from the session. */
+  userProfile?: UserProfile | null;
   counselorName: string;
+  /** Kept for compatibility; the server takes the counselor from the ticket. */
   counselorId?: string;
-  onSuccessSubmitted?: () => void;
+  onSuccessSubmitted?: (treat?: CoffeeTreatItem) => void;
+}
+
+/** Payment details come from server configuration (GET /coffee-treats/config). */
+interface CoffeeTreatConfig {
+  amount: number;
+  paymentMethod: string;
+  accountNumber: string;
+  accountTitle: string;
+  enabled: boolean;
 }
 
 export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
   isOpen,
   onClose,
   ticket,
-  userProfile,
   counselorName,
-  counselorId,
   onSuccessSubmitted,
 }) => {
   const [copied, setCopied] = useState(false);
@@ -42,18 +50,39 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
   const [studentNote, setStudentNote] = useState<string>('');
   const [submitting, setSubmitting] = useState(false);
   const [submittedSuccess, setSubmittedSuccess] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string>('');
+  const [errorMessageText, setErrorMessage] = useState<string>('');
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [config, setConfig] = useState<CoffeeTreatConfig | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    api
+      .get<CoffeeTreatConfig>('/coffee-treats/config')
+      .then((cfg) => {
+        if (cancelled) return;
+        setConfig(cfg);
+        if (!cfg.enabled) setErrorMessage('Coffee treats are not set up yet. Please try again later.');
+      })
+      .catch((err) => {
+        if (!cancelled) setErrorMessage(errorMessage(err, 'Could not load payment details.'));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
-  const ACCOUNT_NUMBER = '03087144168';
-  const ACCOUNT_NAME = 'Hamza Saif';
-  const AMOUNT_PKR = 250;
+  const ACCOUNT_NUMBER = config?.accountNumber || '';
+  const ACCOUNT_NAME = config?.accountTitle || '';
+  const AMOUNT_LABEL = config ? String(config.amount) : '…';
+  const isConfigReady = Boolean(config?.enabled);
 
   const handleCopyAccount = async () => {
+    if (!ACCOUNT_NUMBER) return;
     try {
       await navigator.clipboard.writeText(ACCOUNT_NUMBER);
       setCopied(true);
@@ -102,91 +131,49 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
       setErrorMessage('Please upload your payment screenshot.');
       return;
     }
+    if (!isConfigReady) {
+      setErrorMessage('Coffee treats are not set up yet. Please try again later.');
+      return;
+    }
 
     setSubmitting(true);
     setErrorMessage('');
     setUploadProgress(20);
 
     try {
-      // Compress screenshot to fit securely within Firestore
+      // Compress the screenshot before uploading it
       const { dataUrl: compressedDataUrl } = await compressImage(
         screenshotFile,
         1200,
         1200,
         0.75,
-        (p) => setUploadProgress(p)
+        (p) => setUploadProgress(Math.round(p * 0.6))
       );
 
-      setUploadProgress(70);
-
-      const targetAdminId = counselorId || ticket.expertId || ticket.assignedAdminId || 'admin_hamza_saif';
-      const targetAdminName = counselorName || ticket.expertName || 'Assigned Counselor';
-      const now = Date.now();
-
-      // Save coffee treat record in Firestore
-      await addDoc(collection(db, 'coffee_treats'), {
-        ticketId: ticket.id,
-        ticketNumber: ticket.ticketNumber || '',
-        ticketTitle: ticket.title || '',
-        studentId: userProfile?.uid || ticket.studentId,
-        studentName: userProfile?.displayName || ticket.studentName || 'Student',
-        studentEmail: userProfile?.email || ticket.studentEmail || '',
-        expertId: targetAdminId,
-        expertName: targetAdminName,
-        amount: AMOUNT_PKR,
-        paymentMethod: selectedMethod,
-        accountNumber: ACCOUNT_NUMBER,
-        accountTitle: ACCOUNT_NAME,
-        screenshotUrl: compressedDataUrl,
-        screenshotName: screenshotFile.name,
-        note: studentNote.trim(),
-        status: 'submitted',
-        createdAt: now,
-      });
+      setUploadProgress(60);
+      const baseName = screenshotFile.name.replace(/\.[^.]+$/, '') || 'payment-screenshot';
+      const screenshotUrl = await uploadDataUrl(compressedDataUrl, `${baseName}.jpg`);
 
       setUploadProgress(85);
 
-      // Notify Hamza Saif / Super Admin
-      const usersSnap = await getDocs(collection(db, 'users'));
-      const notifiedUserIds = new Set<string>();
-
-      usersSnap.forEach((uDoc) => {
-        const u = uDoc.data();
-        const isSuperAdmin = u.role === 'super_admin';
-        const isHamzaSaif =
-          uDoc.id === 'admin_hamza_saif' ||
-          (u.displayName || '').toLowerCase().includes('hamza saif') ||
-          u.email === 'mentoflux@gmail.com';
-
-        if ((isSuperAdmin || isHamzaSaif) && !notifiedUserIds.has(uDoc.id)) {
-          notifiedUserIds.add(uDoc.id);
-        }
+      // The server records the treat (amount and account from its config) and
+      // notifies the super admins.
+      const treat = await api.post<CoffeeTreatItem>('/coffee-treats', {
+        ticketId: ticket.id,
+        paymentMethod: selectedMethod,
+        screenshotUrl,
+        screenshotName: screenshotFile.name,
+        note: studentNote.trim() || undefined,
       });
-
-      if (notifiedUserIds.size === 0) {
-        notifiedUserIds.add('admin_hamza_saif');
-      }
-
-      for (const adminUid of notifiedUserIds) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: adminUid,
-          title: `☕ Coffee Treat for ${targetAdminName}!`,
-          message: `${userProfile?.displayName || 'Student'} ne ${targetAdminName} ke liye 250 Rs ki coffee send ki hai (${selectedMethod}). Screenshot attach hai.`,
-          type: 'coffee_treat',
-          queryId: ticket.id,
-          isRead: false,
-          createdAt: now,
-        }).catch((err) => console.warn('Coffee notification error:', err));
-      }
 
       setUploadProgress(100);
       setSubmittedSuccess(true);
       if (onSuccessSubmitted) {
-        onSuccessSubmitted();
+        onSuccessSubmitted(treat);
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Failed to submit coffee treat:', err);
-      setErrorMessage(err?.message || 'Failed to submit screenshot. Please check connection and try again.');
+      setErrorMessage(errorMessage(err, 'Failed to submit screenshot. Please check connection and try again.'));
     } finally {
       setSubmitting(false);
     }
@@ -246,7 +233,7 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
                 </div>
                 <div className="flex justify-between text-slate-600">
                   <span>Amount:</span>
-                  <span className="font-bold text-emerald-700">Rs. 250</span>
+                  <span className="font-bold text-emerald-700">Rs. {AMOUNT_LABEL}</span>
                 </div>
                 <div className="flex justify-between text-slate-600">
                   <span>Paid via:</span>
@@ -254,7 +241,7 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
                 </div>
                 <div className="flex justify-between text-slate-600">
                   <span>Account:</span>
-                  <span className="font-mono text-slate-700">03087144168 (Hamza Saif)</span>
+                  <span className="font-mono text-slate-700">{ACCOUNT_NUMBER}{ACCOUNT_NAME ? ` (${ACCOUNT_NAME})` : ''}</span>
                 </div>
               </div>
 
@@ -302,7 +289,7 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
                       Payment Account Details
                     </span>
                     <span className="text-[10px] font-bold text-amber-700 bg-white px-2 py-0.5 rounded-full border border-amber-200">
-                      Rs. 250
+                      Rs. {AMOUNT_LABEL}
                     </span>
                   </div>
                   <span className="text-[10px] text-slate-500 font-medium">
@@ -427,10 +414,10 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
               </div>
 
               {/* Error Message */}
-              {errorMessage && (
+              {errorMessageText && (
                 <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-1.5">
                   <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{errorMessage}</span>
+                  <span>{errorMessageText}</span>
                 </div>
               )}
 
@@ -438,9 +425,9 @@ export const CoffeeTreatModal: React.FC<CoffeeTreatModalProps> = ({
               <div className="pt-1 space-y-1.5">
                 <button
                   type="submit"
-                  disabled={submitting || !screenshotFile}
+                  disabled={submitting || !screenshotFile || !isConfigReady}
                   className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs shadow-xs transition-all flex items-center justify-center gap-2 ${
-                    submitting || !screenshotFile
+                    submitting || !screenshotFile || !isConfigReady
                       ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
                       : 'bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 hover:from-amber-600 hover:to-orange-600 text-white cursor-pointer active:scale-[0.99] shadow-md shadow-amber-500/10'
                   }`}

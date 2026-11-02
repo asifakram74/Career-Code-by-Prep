@@ -27,16 +27,21 @@ app.use('/api', (_req: Request, res: Response) => res.status(404).json({ error: 
 app.use(errorHandler);
 
 async function start() {
+  const server = http.createServer(app);
+
   if (config.isProduction) {
     const dist = path.resolve(config.rootDir, 'dist');
     app.use(express.static(dist));
     app.get('*', (_req: Request, res: Response) => res.sendFile(path.join(dist, 'index.html')));
   } else {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+    // Hot reload shares the app's HTTP server instead of opening another port.
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: { server, clientPort: config.port } },
+      appType: 'spa',
+    });
     app.use(vite.middlewares);
   }
 
-  const server = http.createServer(app);
   attachRealtime(server);
   server.listen(config.port, '0.0.0.0', () => {
     console.log(`Career Code server running on http://localhost:${config.port}`);

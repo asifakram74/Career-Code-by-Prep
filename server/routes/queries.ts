@@ -5,7 +5,7 @@ import { db, t } from '../db';
 import { currentUser, isAdmin, isManager, requireAuth, requireRole, type UserRow } from '../auth';
 import { isQueryStaff, loadVisibleQuery, visibleQueriesFilter, adminCategoryIds, type QueryRow } from '../access';
 import { HttpError, newId, parse, route } from '../http';
-import { emitQueryChange, emitToQueryRoom, emitToUser } from '../realtime';
+import { broadcastChange, emitQueryChange, emitToQueryRoom, emitToUser } from '../realtime';
 import { allActiveAdminIds, notify } from '../notify';
 import { serializeMessage, serializeQueries, serializeRow } from '../serialize';
 import { audit } from '../audit';
@@ -225,7 +225,7 @@ queriesRouter.post(
     }
 
     const now = Date.now();
-    const lastReplyPreview = body.audioUrl && !body.detail ? `🎤 Voice Note: ${body.title}` : `📌 Initial Query: ${body.title}`;
+    const lastReplyPreview = body.audioUrl ? `🎤 Voice Note: ${body.title}` : `📌 Initial Query: ${body.title}`;
 
     const result = await db.transaction(async (tx) => {
       // Reuse the student's existing (not hidden) chat with this counselor.
@@ -617,6 +617,7 @@ queriesRouter.post(
     });
 
     const [serialized] = await broadcastQueries([ticket]);
+    broadcastChange('reviews');
     await notify([ticket.expertId], {
       title: `${'⭐'.repeat(body.rating)} New Rating from ${user.displayName}`,
       message: body.feedback || `Ticket #${ticket.ticketNumber} was rated ${body.rating}/5.`,

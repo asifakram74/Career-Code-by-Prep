@@ -1,17 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-  updateDoc,
-  getDocs,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { UserProfile, CategoryItem, QueryTicket, formatRoleName } from '../../types';
+import { api, errorMessage } from '../../lib/api';
+import { useApiResource, useLiveQueries } from '../../lib/liveData';
+import { onDataChanged } from '../../lib/socket';
+import { UserProfile, CategoryItem, formatRoleName } from '../../types';
 import { sortCategoriesGeneralFirst } from '../../constants/officialCategories';
 import { CustomSelect } from '../common/CustomSelect';
 import {
@@ -38,21 +30,39 @@ import {
   GraduationCap,
 } from 'lucide-react';
 
+const ADMIN_ROLES = ['normal_admin', 'expert_admin', 'super_admin'];
+const MIN_PASSWORD_LENGTH = 8;
+const REPLIES_REFRESH_MS = 60_000;
+
+/** Account status with a safe default for records missing the field. */
+const statusOf = (u: Pick<UserProfile, 'status'>) => u.status || 'active';
+
 export const AdminManagement: React.FC = () => {
   const { userProfile } = useAuth();
-  const isSuperAdmin =
-    userProfile?.role === 'super_admin' ||
-    userProfile?.email?.toLowerCase() === 'mentoflux@gmail.com';
-  const isExpertAdmin =
-    userProfile?.role === 'expert_admin' ||
-    (!isSuperAdmin && userProfile?.email?.toLowerCase() === 'huzaifa678ops@gmail.com');
+  const isSuperAdmin = userProfile?.role === 'super_admin';
+  const isExpertAdmin = userProfile?.role === 'expert_admin';
+  const isManager = isSuperAdmin || isExpertAdmin;
 
-  const [admins, setAdmins] = useState<UserProfile[]>([]);
-  const [categories, setCategories] = useState<CategoryItem[]>([]);
-  const [queries, setQueries] = useState<QueryTicket[]>([]);
-  const [messages24h, setMessages24h] = useState<{ senderId: string; createdAt: number }[]>([]);
+  /** Whether the viewer may manage another account (mirrors the server's canManageUser; never self). */
+  const canManageUser = (target: UserProfile) =>
+    target.uid !== userProfile?.uid &&
+    (isSuperAdmin || (isExpertAdmin && (target.role === 'normal_admin' || target.role === 'student')));
+
+  const { data: adminDirectory, setData: setAdminDirectory } = useApiResource<UserProfile[]>(
+    '/admins',
+    ['users'],
+    []
+  );
+  const admins = useMemo(() => adminDirectory.filter((u) => ADMIN_ROLES.includes(u.role)), [adminDirectory]);
+  const { data: rawCategories } = useApiResource<CategoryItem[]>('/categories', ['categories'], []);
+  const categories = useMemo(() => sortCategoriesGeneralFirst(rawCategories), [rawCategories]);
+  // All tickets, for accurate workload counts (managers only).
+  const { queries } = useLiveQueries({ scope: 'all', enabled: isManager });
+  const [replies24h, setReplies24h] = useState<Record<string, number>>({});
   const [searchQuery, setSearchQuery] = useState('');
   const [filterRole, setFilterRole] = useState('all');
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   // Modals
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -71,6 +81,7 @@ export const AdminManagement: React.FC = () => {
   const [deactivatingAdmin, setDeactivatingAdmin] = useState<UserProfile | null>(null);
   const [reassignTargetExpertId, setReassignTargetExpertId] = useState('');
   const [reassignLoading, setReassignLoading] = useState(false);
+  const [deactivateError, setDeactivateError] = useState<string | null>(null);
 
   // View & Edit Profile state
   const [viewingProfileAdmin, setViewingProfileAdmin] = useState<UserProfile | null>(null);
@@ -99,85 +110,35 @@ export const AdminManagement: React.FC = () => {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  // Listen to all users with admin roles
+  // Replies per admin in the last rolling 24 hours (server-side aggregate).
+  const loadReplies24h = useCallback(async () => {
+    if (!isManager) return;
+    try {
+      setReplies24h(await api.get<Record<string, number>>('/admin/stats/replies-24h'));
+    } catch {
+      // Non-critical column; keep the last known counts.
+    }
+  }, [isManager]);
+
   useEffect(() => {
-    const q = query(
-      collection(db, 'users'),
-      where('role', 'in', ['normal_admin', 'expert_admin', 'super_admin'])
-    );
+    loadReplies24h();
+    const timer = window.setInterval(loadReplies24h, REPLIES_REFRESH_MS);
+    const off = onDataChanged(['users'], loadReplies24h);
+    return () => {
+      window.clearInterval(timer);
+      off();
+    };
+  }, [loadReplies24h]);
 
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: UserProfile[] = [];
-        const seen = new Set<string>();
-        snapshot.forEach((d) => {
-          const data = d.data();
-          const u = { ...data, uid: d.id } as UserProfile;
-          const key = (u.email || u.displayName || u.uid).trim().toLowerCase();
-          if (!seen.has(key)) {
-            seen.add(key);
-            list.push(u);
-          }
-        });
-        setAdmins(list);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'users');
-      }
-    );
+  const showNotice = (message: string) => {
+    setActionNotice(message);
+    setTimeout(() => setActionNotice(null), 5000);
+  };
 
-    return () => unsubscribe();
-  }, []);
-
-  // Listen to categories
-  useEffect(() => {
-    const q = query(collection(db, 'categories'));
-    const unsub = onSnapshot(q, (snapshot) => {
-      const list: CategoryItem[] = [];
-      snapshot.forEach((d) => {
-        list.push({ id: d.id, ...d.data() } as CategoryItem);
-      });
-      setCategories(sortCategoriesGeneralFirst(list));
-    });
-    return () => unsub();
-  }, []);
-
-  // Listen to all queries for accurate ticket and workload counts
-  useEffect(() => {
-    const q = query(collection(db, 'queries'));
-    const unsub = onSnapshot(q, (snapshot) => {
-      const list: QueryTicket[] = [];
-      snapshot.forEach((d) => {
-        list.push({ id: d.id, ...d.data() } as QueryTicket);
-      });
-      setQueries(list);
-    });
-    return () => unsub();
-  }, []);
-
-  // Listen to messages in the last rolling 24 hours
-  useEffect(() => {
-    const rolling24hAgo = Date.now() - 24 * 60 * 60 * 1000;
-    const q = query(collection(db, 'messages'), where('createdAt', '>=', rolling24hAgo));
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: { senderId: string; createdAt: number }[] = [];
-        snapshot.forEach((d) => {
-          list.push({
-            senderId: d.data().senderId,
-            createdAt: d.data().createdAt,
-          });
-        });
-        setMessages24h(list);
-      },
-      (error) => {
-        // Fallback
-      }
-    );
-    return () => unsub();
-  }, []);
+  /** Replaces an admin in the local directory with the server's copy. */
+  const applyProfile = (profile: UserProfile) => {
+    setAdminDirectory((prev) => prev.map((a) => (a.uid === profile.uid ? { ...a, ...profile } : a)));
+  };
 
   // Activity calculation helper
   const getActivityIndicator = (lastActiveAt?: number) => {
@@ -209,33 +170,29 @@ export const AdminManagement: React.FC = () => {
       return;
     }
 
+    if (modalPass.length < MIN_PASSWORD_LENGTH) {
+      setModalError(`Initial password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+
     if (createRole === 'expert_admin' && !isSuperAdmin) {
-      setModalError('Only the Expert Admin can create administrator accounts.');
+      setModalError('Only a Super Admin can create Expert Admin accounts.');
       return;
     }
 
     setModalLoading(true);
     try {
-      const res = await fetch('/api/admin/create-admin-account', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          creatorRole: userProfile?.role,
-          email: modalEmail.trim(),
-          password: modalPass,
-          displayName: modalName.trim(),
-          role: createRole,
-          professionalTitle: modalTitle.trim(),
-          shortDescription: modalDesc.trim(),
-          phoneNumber: modalPhone.trim(),
-          assignedCategories: modalCategories,
-        }),
+      const name = modalName.trim();
+      await api.post<{ success: boolean; profile: UserProfile }>('/admin/admins', {
+        email: modalEmail.trim(),
+        password: modalPass,
+        displayName: name,
+        role: createRole,
+        professionalTitle: modalTitle.trim() || undefined,
+        shortDescription: modalDesc.trim() || undefined,
+        phoneNumber: modalPhone.trim() || undefined,
+        assignedCategories: modalCategories,
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to create admin.');
-      }
 
       setShowCreateModal(false);
       setModalName('');
@@ -245,48 +202,64 @@ export const AdminManagement: React.FC = () => {
       setModalTitle('');
       setModalDesc('');
       setModalCategories([]);
-    } catch (err: any) {
-      setModalError(err.message);
+      showNotice(`Account created for ${name}. They must choose a new password the first time they sign in.`);
+    } catch (err) {
+      setModalError(errorMessage(err, 'Failed to create admin.'));
     } finally {
       setModalLoading(false);
     }
   };
 
-  // Deactivation and Reassignment
+  // Deactivation: the server hands open queries to the chosen admin, or moves
+  // them to the unassigned queue when no admin is chosen.
   const handleConfirmDeactivation = async () => {
     if (!deactivatingAdmin) return;
     setReassignLoading(true);
+    setDeactivateError(null);
     try {
-      const adminId = deactivatingAdmin.uid;
-      const openAdminQueries = queries.filter(
-        (q) => q.expertId === adminId && q.status !== 'resolved'
+      const { profile, reassignedCount } = await api.patch<{ profile: UserProfile; reassignedCount: number }>(
+        `/admin/users/${encodeURIComponent(deactivatingAdmin.uid)}/status`,
+        { status: 'deactivated', reassignToUid: reassignTargetExpertId || undefined }
       );
-
-      // Reassign open queries if selected
-      if (reassignTargetExpertId && openAdminQueries.length > 0) {
-        const targetAdmin = admins.find((a) => a.uid === reassignTargetExpertId);
-        for (const t of openAdminQueries) {
-          const tRef = doc(db, 'queries', t.id);
-          await updateDoc(tRef, {
-            expertId: reassignTargetExpertId,
-            expertName: targetAdmin?.displayName || 'Reassigned Expert',
-            expertRole: targetAdmin?.role || 'normal_admin',
-            assignmentStatus: 'reassigned',
-            updatedAt: Date.now(),
-          });
-        }
-      }
-
-      // Update status
-      const adminRef = doc(db, 'users', adminId);
-      await updateDoc(adminRef, { status: 'deactivated' });
-
+      applyProfile(profile);
+      showNotice(
+        `${deactivatingAdmin.displayName} has been deactivated.${
+          reassignedCount
+            ? ` ${reassignedCount} open ${reassignedCount === 1 ? 'query was' : 'queries were'} handed over.`
+            : ''
+        }`
+      );
       setDeactivatingAdmin(null);
       setReassignTargetExpertId('');
-    } catch (err: any) {
-      console.error(err);
+    } catch (err) {
+      setDeactivateError(errorMessage(err, 'Could not deactivate this administrator.'));
     } finally {
       setReassignLoading(false);
+    }
+  };
+
+  const handleReactivate = async (adm: UserProfile) => {
+    setActionError(null);
+    try {
+      const { profile } = await api.patch<{ profile: UserProfile }>(
+        `/admin/users/${encodeURIComponent(adm.uid)}/status`,
+        { status: 'active' }
+      );
+      applyProfile(profile);
+      showNotice(`${adm.displayName} has been reactivated.`);
+    } catch (err) {
+      setActionError(errorMessage(err, 'Could not reactivate this administrator.'));
+    }
+  };
+
+  /** Deactivate opens the hand-over dialog; Reactivate applies immediately. */
+  const handleStatusButton = (adm: UserProfile) => {
+    if (statusOf(adm) === 'active') {
+      setDeactivateError(null);
+      setReassignTargetExpertId('');
+      setDeactivatingAdmin(adm);
+    } else {
+      handleReactivate(adm);
     }
   };
 
@@ -319,165 +292,90 @@ export const AdminManagement: React.FC = () => {
     setProfileSuccess(null);
 
     try {
-      const now = Date.now();
-      const updatesPayload: any = {
+      const updatesPayload: Record<string, unknown> = {
         displayName: profileName.trim(),
         professionalTitle: profileTitle.trim(),
         shortDescription: profileDesc.trim(),
         phoneNumber: profilePhone.trim(),
-        assignedCategories: profileCategories,
       };
+
+      // Category assignments are granted by managers only, never by a normal admin to themselves.
+      if (isManager) {
+        updatesPayload.assignedCategories = profileCategories;
+      }
 
       if (isSuperAdmin && viewingProfileAdmin.role !== 'super_admin') {
         updatesPayload.role = profileRole;
       }
 
-      // Try server API first
-      let apiSuccess = false;
-      try {
-        const res = await fetch('/api/admin/update-admin-profile', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            callerUid: userProfile?.uid || 'admin_hamza_saif',
-            callerEmail: userProfile?.email || 'mentoflux@gmail.com',
-            targetUid: viewingProfileAdmin.uid,
-            targetEmail: viewingProfileAdmin.email,
-            updates: updatesPayload,
-          }),
-        });
-        const data = await res.json();
-        if (res.ok && data.success) {
-          apiSuccess = true;
-        }
-      } catch (apiErr) {
-        console.warn('API update-admin-profile fallback to direct Firestore:', apiErr);
-      }
-
-      // Direct Firestore fallback / sync
-      if (!apiSuccess) {
-        await updateDoc(doc(db, 'users', viewingProfileAdmin.uid), {
-          ...updatesPayload,
-          updatedAt: now,
-        });
-
-        // Sync categories collection
-        for (const cat of categories) {
-          const catRef = doc(db, 'categories', cat.id);
-          const shouldHave = profileCategories.includes(cat.id);
-          const currentAdmins = cat.assignedAdminIds || [];
-          const has = currentAdmins.includes(viewingProfileAdmin.uid);
-
-          if (shouldHave && !has) {
-            await updateDoc(catRef, {
-              assignedAdminIds: [...currentAdmins, viewingProfileAdmin.uid],
-              updatedAt: now,
-            }).catch(() => {});
-          } else if (!shouldHave && has) {
-            await updateDoc(catRef, {
-              assignedAdminIds: currentAdmins.filter((id) => id !== viewingProfileAdmin.uid),
-              updatedAt: now,
-            }).catch(() => {});
-          }
-        }
-      }
-
-      // Update local state immediately
-      setAdmins((prev) =>
-        prev.map((a) =>
-          a.uid === viewingProfileAdmin.uid
-            ? { ...a, ...updatesPayload, updatedAt: now }
-            : a
-        )
+      const { profile } = await api.patch<{ success: boolean; profile: UserProfile }>(
+        `/admin/admins/${encodeURIComponent(viewingProfileAdmin.uid)}`,
+        updatesPayload
       );
 
+      applyProfile(profile);
       setProfileSuccess('Administrator profile updated successfully.');
       setIsEditingProfile(false);
-      setViewingProfileAdmin((prev) =>
-        prev ? { ...prev, ...updatesPayload, updatedAt: now } : null
-      );
+      setViewingProfileAdmin((prev) => (prev ? { ...prev, ...profile } : null));
       setTimeout(() => setProfileSuccess(null), 3000);
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${viewingProfileAdmin.uid}`);
-      setProfileError(err.message || 'Failed to update profile.');
+    } catch (err) {
+      setProfileError(errorMessage(err, 'Failed to update profile.'));
     } finally {
       setProfileSaving(false);
     }
   };
 
-  // Change / Update Administrator Password
+  // Reset another administrator's password (they must change it at next sign-in)
   const handleUpdatePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!passwordAdmin) return;
     setPasswordError(null);
     setPasswordSuccess(null);
 
-    if (newAdminPassword.length < 6) {
-      setPasswordError('Password must be at least 6 characters.');
+    if (newAdminPassword.length < MIN_PASSWORD_LENGTH) {
+      setPasswordError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
       return;
     }
 
     setPasswordLoading(true);
     try {
-      const res = await fetch('/api/admin/update-user-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callerUid: userProfile?.uid || 'admin_hamza_saif',
-          callerEmail: userProfile?.email || 'mentoflux@gmail.com',
-          targetUid: passwordAdmin.uid,
-          targetEmail: passwordAdmin.email,
-          newPassword: newAdminPassword,
-        }),
+      await api.put(`/admin/users/${encodeURIComponent(passwordAdmin.uid)}/password`, {
+        newPassword: newAdminPassword,
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to update password.');
-      }
-
-      setPasswordSuccess(`Password updated successfully for ${passwordAdmin.displayName}!`);
+      setPasswordSuccess(
+        `Password updated for ${passwordAdmin.displayName}. They have been signed out and must change it at their next sign-in.`
+      );
       setTimeout(() => {
         setPasswordAdmin(null);
         setNewAdminPassword('');
         setPasswordSuccess(null);
-      }, 1500);
-    } catch (err: any) {
-      setPasswordError(err.message || 'Error updating administrator password.');
+      }, 2500);
+    } catch (err) {
+      setPasswordError(errorMessage(err, 'Error updating administrator password.'));
     } finally {
       setPasswordLoading(false);
     }
   };
 
-  // Permanently Delete Administrator
+  // Permanently Delete Administrator (server hands open queries over or to the unassigned queue)
   const handleConfirmDeleteAdmin = async () => {
     if (!deletingAdmin) return;
     setDeleteLoading(true);
     setDeleteError(null);
     try {
-      const res = await fetch('/api/admin/delete-admin-account', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callerUid: userProfile?.uid || 'admin_hamza_saif',
-          callerEmail: userProfile?.email || 'mentoflux@gmail.com',
-          targetUid: deletingAdmin.uid,
-          targetEmail: deletingAdmin.email,
-          reassignToUid: deleteReassignTarget || undefined,
-        }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to delete administrator.');
-      }
+      const qs = deleteReassignTarget ? `?reassignToUid=${encodeURIComponent(deleteReassignTarget)}` : '';
+      const { message } = await api.del<{ success: boolean; message: string }>(
+        `/admin/admins/${encodeURIComponent(deletingAdmin.uid)}${qs}`
+      );
 
       // Update local state immediately
-      setAdmins((prev) => prev.filter((a) => a.uid !== deletingAdmin.uid));
+      setAdminDirectory((prev) => prev.filter((a) => a.uid !== deletingAdmin.uid));
       setDeletingAdmin(null);
       setDeleteReassignTarget('');
-    } catch (err: any) {
-      setDeleteError(err.message || 'Error deleting administrator account.');
+      showNotice(message || `Administrator ${deletingAdmin.displayName} permanently deleted.`);
+    } catch (err) {
+      setDeleteError(errorMessage(err, 'Error deleting administrator account.'));
     } finally {
       setDeleteLoading(false);
     }
@@ -531,6 +429,23 @@ export const AdminManagement: React.FC = () => {
           )}
         </div>
       </div>
+
+      {actionNotice && (
+        <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2.5">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span>{actionNotice}</span>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2.5">
+          <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
+          <span className="flex-1">{actionError}</span>
+          <button type="button" onClick={() => setActionError(null)} className="text-rose-400 hover:text-rose-600 cursor-pointer">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
@@ -588,16 +503,13 @@ export const AdminManagement: React.FC = () => {
               ) : (
                 filteredAdmins.map((adm) => {
                   const activity = getActivityIndicator(adm.lastActiveAt);
-                  const repliesLast24h = messages24h.filter((m) => m.senderId === adm.uid).length;
+                  const repliesLast24h = replies24h[adm.uid] || 0;
                   const adminQueries = queries.filter((q) => q.expertId === adm.uid);
                   const pendingCount = adminQueries.filter((q) => q.status === 'open' || q.status === 'in_progress').length;
                   const resolvedCount = adminQueries.filter((q) => q.status === 'resolved').length;
 
-                  // Permission flags: Super Admin manages all, Expert Admin manages Normal Admins, or admin manages own account
-                  const canManageThisAdmin =
-                    isSuperAdmin ||
-                    (isExpertAdmin && adm.role === 'normal_admin') ||
-                    adm.uid === userProfile?.uid;
+                  // Permission flags: Super Admin manages all others, Expert Admin manages Normal Admins
+                  const canManageThisAdmin = canManageUser(adm);
 
                   return (
                     <tr key={adm.uid} className="hover:bg-slate-50 transition-colors">
@@ -679,12 +591,12 @@ export const AdminManagement: React.FC = () => {
                       <td className="py-3 px-4 whitespace-nowrap">
                         <span
                           className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                            adm.status === 'active'
+                            statusOf(adm) === 'active'
                               ? 'bg-emerald-50 text-emerald-700'
                               : 'bg-rose-50 text-rose-700'
                           }`}
                         >
-                          {adm.status.toUpperCase()}
+                          {statusOf(adm).toUpperCase()}
                         </span>
                       </td>
 
@@ -723,20 +635,19 @@ export const AdminManagement: React.FC = () => {
                           {canManageThisAdmin && adm.role !== 'super_admin' && adm.uid !== userProfile?.uid && (
                             <button
                               type="button"
-                              onClick={() => setDeactivatingAdmin(adm)}
+                              onClick={() => handleStatusButton(adm)}
                               className={`text-[11px] px-2.5 py-1.5 rounded-lg font-semibold transition-colors cursor-pointer ${
-                                adm.status === 'active'
+                                statusOf(adm) === 'active'
                                   ? 'text-amber-700 bg-amber-50 hover:bg-amber-100'
                                   : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
                               }`}
                             >
-                              {adm.status === 'active' ? 'Deactivate' : 'Reactivate'}
+                              {statusOf(adm) === 'active' ? 'Deactivate' : 'Reactivate'}
                             </button>
                           )}
 
                           {/* Permanently Delete (Super Admin can delete ANY other admin; Expert Admin can delete normal admins) */}
-                          {((isSuperAdmin && adm.uid !== userProfile?.uid) ||
-                            (isExpertAdmin && adm.role === 'normal_admin' && adm.uid !== userProfile?.uid)) && (
+                          {canManageThisAdmin && (
                               <button
                                 type="button"
                                 onClick={() => {
@@ -770,15 +681,12 @@ export const AdminManagement: React.FC = () => {
           ) : (
             filteredAdmins.map((adm) => {
               const activity = getActivityIndicator(adm.lastActiveAt);
-              const repliesLast24h = messages24h.filter((m) => m.senderId === adm.uid).length;
+              const repliesLast24h = replies24h[adm.uid] || 0;
               const adminQueries = queries.filter((q) => q.expertId === adm.uid);
               const pendingCount = adminQueries.filter((q) => q.status === 'open' || q.status === 'in_progress').length;
               const resolvedCount = adminQueries.filter((q) => q.status === 'resolved').length;
 
-              const canManageThisAdmin =
-                isSuperAdmin ||
-                (isExpertAdmin && adm.role === 'normal_admin') ||
-                adm.uid === userProfile?.uid;
+              const canManageThisAdmin = canManageUser(adm);
 
               return (
                 <div key={adm.uid} className="p-4 space-y-3 bg-white hover:bg-slate-50/50 transition-colors">
@@ -854,12 +762,12 @@ export const AdminManagement: React.FC = () => {
                   <div className="flex items-center justify-between text-xs pt-1">
                     <span
                       className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                        adm.status === 'active'
+                        statusOf(adm) === 'active'
                           ? 'bg-emerald-50 text-emerald-700'
                           : 'bg-rose-50 text-rose-700'
                       }`}
                     >
-                      {adm.status.toUpperCase()}
+                      {statusOf(adm).toUpperCase()}
                     </span>
 
                     {activity.isStale ? (
@@ -905,19 +813,18 @@ export const AdminManagement: React.FC = () => {
                     {canManageThisAdmin && adm.role !== 'super_admin' && adm.uid !== userProfile?.uid && (
                       <button
                         type="button"
-                        onClick={() => setDeactivatingAdmin(adm)}
+                        onClick={() => handleStatusButton(adm)}
                         className={`px-3 py-2 text-xs rounded-xl font-semibold transition-colors cursor-pointer ${
-                          adm.status === 'active'
+                          statusOf(adm) === 'active'
                             ? 'text-amber-700 bg-amber-50 hover:bg-amber-100'
                             : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100'
                         }`}
                       >
-                        {adm.status === 'active' ? 'Deactivate' : 'Reactivate'}
+                        {statusOf(adm) === 'active' ? 'Deactivate' : 'Reactivate'}
                       </button>
                     )}
 
-                    {((isSuperAdmin && adm.uid !== userProfile?.uid) ||
-                      (isExpertAdmin && adm.role === 'normal_admin' && adm.uid !== userProfile?.uid)) && (
+                    {canManageThisAdmin && (
                       <button
                         type="button"
                         onClick={() => {
@@ -1006,7 +913,7 @@ export const AdminManagement: React.FC = () => {
                   required
                   value={modalPass}
                   onChange={(e) => setModalPass(e.target.value)}
-                  placeholder="Min 6 characters"
+                  placeholder="Min 8 characters"
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-pink-500"
                 />
               </div>
@@ -1104,6 +1011,13 @@ export const AdminManagement: React.FC = () => {
                     This administrator currently has {pendingCount} queries awaiting handling.
                   </div>
 
+                  {deactivateError && (
+                    <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
+                      <span>{deactivateError}</span>
+                    </div>
+                  )}
+
                   {pendingCount > 0 && (
                     <div>
                       <label className="block font-semibold text-slate-700 mb-1">
@@ -1115,7 +1029,7 @@ export const AdminManagement: React.FC = () => {
                         options={[
                           { value: '', label: 'Do not reassign (Leave in unassigned queue)' },
                           ...admins
-                            .filter((a) => a.uid !== deactivatingAdmin.uid && a.status === 'active')
+                            .filter((a) => a.uid !== deactivatingAdmin.uid && statusOf(a) === 'active')
                             .map((a) => ({
                               value: a.uid,
                               label: a.displayName || 'Advisor',
@@ -1204,7 +1118,7 @@ export const AdminManagement: React.FC = () => {
                     required
                     value={newAdminPassword}
                     onChange={(e) => setNewAdminPassword(e.target.value)}
-                    placeholder="Enter at least 6 characters"
+                    placeholder="Enter at least 8 characters"
                     className="w-full pl-3 pr-10 py-2 border border-slate-300 rounded-xl text-slate-900 focus:outline-none focus:ring-2 focus:ring-pink-500"
                   />
                   <button
@@ -1216,7 +1130,7 @@ export const AdminManagement: React.FC = () => {
                   </button>
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
-                  The administrator will immediately use this new password to sign in.
+                  The administrator is signed out everywhere and must choose a new password the next time they sign in with this one.
                 </p>
               </div>
 
@@ -1283,7 +1197,7 @@ export const AdminManagement: React.FC = () => {
                       <span className="font-bold block">
                         {pendingCount} Active Queries Assigned
                       </span>
-                      Please choose an active administrator to receive these queries upon deletion.
+                      Choose an active administrator to receive these queries, or leave them in the unassigned queue.
                       <div className="mt-2.5">
                         <label className="block font-semibold text-slate-800 mb-1">
                           Reassign Queries To:
@@ -1292,9 +1206,9 @@ export const AdminManagement: React.FC = () => {
                           value={deleteReassignTarget}
                           onChange={(val) => setDeleteReassignTarget(val)}
                           options={[
-                            { value: '', label: '-- Choose Reassigned Admin --' },
+                            { value: '', label: '-- Leave in unassigned queue --' },
                             ...admins
-                              .filter((a) => a.uid !== deletingAdmin.uid && a.status === 'active')
+                              .filter((a) => a.uid !== deletingAdmin.uid && statusOf(a) === 'active')
                               .map((a) => ({
                                 value: a.uid,
                                 label: a.displayName || 'Advisor',
@@ -1355,12 +1269,12 @@ export const AdminManagement: React.FC = () => {
                     </span>
                     <span
                       className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                        viewingProfileAdmin.status === 'active'
+                        statusOf(viewingProfileAdmin) === 'active'
                           ? 'bg-emerald-50 text-emerald-700'
                           : 'bg-rose-50 text-rose-700'
                       }`}
                     >
-                      {viewingProfileAdmin.status.toUpperCase()}
+                      {statusOf(viewingProfileAdmin).toUpperCase()}
                     </span>
                   </div>
                 </div>
@@ -1376,9 +1290,7 @@ export const AdminManagement: React.FC = () => {
             </div>
 
             {/* Modal Tabs */}
-            {(isSuperAdmin ||
-              (isExpertAdmin && viewingProfileAdmin.role === 'normal_admin') ||
-              viewingProfileAdmin.uid === userProfile?.uid) && (
+            {(canManageUser(viewingProfileAdmin) || viewingProfileAdmin.uid === userProfile?.uid) && (
               <div className="flex items-center gap-2 mt-3 p-1 bg-slate-100 rounded-xl">
                 <button
                   type="button"
@@ -1400,8 +1312,22 @@ export const AdminManagement: React.FC = () => {
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Edit Profile & Categories
+                  {isManager ? 'Edit Profile & Categories' : 'Edit Profile'}
                 </button>
+              </div>
+            )}
+
+            {profileError && (
+              <div className="mt-3 p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
+                <span>{profileError}</span>
+              </div>
+            )}
+
+            {profileSuccess && (
+              <div className="mt-3 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{profileSuccess}</span>
               </div>
             )}
 
@@ -1423,7 +1349,7 @@ export const AdminManagement: React.FC = () => {
                   </div>
                   <div>
                     <span className="text-[11px] text-slate-400 block font-medium">Account Status</span>
-                    <span className="font-semibold text-slate-900 capitalize">{viewingProfileAdmin.status}</span>
+                    <span className="font-semibold text-slate-900 capitalize">{statusOf(viewingProfileAdmin)}</span>
                   </div>
                 </div>
 
@@ -1493,7 +1419,8 @@ export const AdminManagement: React.FC = () => {
                 {/* Modal Footer Actions */}
                 <div className="flex items-center justify-between pt-4 border-t border-slate-100">
                   <div className="flex items-center gap-2">
-                    {/* Quick change password button */}
+                    {/* Quick change password button (only for accounts the viewer manages; self uses profile settings) */}
+                    {canManageUser(viewingProfileAdmin) && (
                     <button
                       type="button"
                       onClick={() => {
@@ -1509,10 +1436,11 @@ export const AdminManagement: React.FC = () => {
                       <KeyRound className="w-3.5 h-3.5" />
                       <span>Change Password</span>
                     </button>
+                    )}
                   </div>
 
                   <div className="flex items-center gap-2">
-                    {(isSuperAdmin || (isExpertAdmin && viewingProfileAdmin.role === 'normal_admin')) && (
+                    {canManageUser(viewingProfileAdmin) && (
                       <button
                         type="button"
                         onClick={() => setIsEditingProfile(true)}
@@ -1596,6 +1524,7 @@ export const AdminManagement: React.FC = () => {
                   />
                 </div>
 
+                {isManager && (
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="block font-semibold text-slate-700">Assigned Categories</label>
@@ -1629,6 +1558,7 @@ export const AdminManagement: React.FC = () => {
                     })}
                   </div>
                 </div>
+                )}
 
                 <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
                   <button
