@@ -1,22 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  collection,
-  query,
-  where,
-  onSnapshot,
-  doc,
-  updateDoc,
-  addDoc,
-  getDocs,
-  deleteDoc,
-  arrayUnion,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
 import { useAuth } from '../../context/AuthContext';
 import { QueryTicket } from '../../types';
 import { ConversationView } from '../common/ConversationView';
-import { offlineStorage } from '../../lib/offlineStorage';
+import { api, errorMessage } from '../../lib/api';
+import { useLiveQueries, sortByActivity } from '../../lib/liveData';
 import { navigationHistory } from '../../lib/navigationHistory';
 import {
   Search,
@@ -26,7 +13,6 @@ import {
   Mic,
   X,
   Trash2,
-  Bookmark,
 } from 'lucide-react';
 
 interface NormalAdminDashboardProps {
@@ -39,49 +25,27 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
   onNavigateTab,
 }) => {
   const { userProfile } = useAuth();
-  const [assignedTickets, setAssignedTickets] = useState<QueryTicket[]>(() => {
-    if (!userProfile?.uid) return [];
-    return offlineStorage.get<QueryTicket[]>(`cc_admin_queries_${userProfile.uid}`, []);
+  const { queries: assignedTickets, setQueries: setAssignedTickets, loading } = useLiveQueries({
+    enabled: Boolean(userProfile),
   });
   const [activeTicket, setActiveTicket] = useState<QueryTicket | null>(null);
 
   // Exact 4 categories: 'all' | 'unread' | 'resolved' | 'unresolved'
   const [filter, setFilter] = useState<'all' | 'unread' | 'resolved' | 'unresolved'>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [loading, setLoading] = useState(() => {
-    if (!userProfile?.uid) return true;
-    const cached = offlineStorage.get<QueryTicket[]>(`cc_admin_queries_${userProfile.uid}`, []);
-    return cached.length === 0;
-  });
-
   // "Delete for me" states & saved bookmark warning
   const [deleteModalTicket, setDeleteModalTicket] = useState<QueryTicket | null>(null);
-  const [savedCountInTargetChat, setSavedCountInTargetChat] = useState<number>(0);
-  const [checkingSaved, setCheckingSaved] = useState<boolean>(false);
   const [deletingForMe, setDeletingForMe] = useState<boolean>(false);
+  const [deleteError, setDeleteError] = useState('');
 
   // Long-press timer references
   const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isLongPressRef = useRef<boolean>(false);
 
-  const openDeleteModal = async (t: QueryTicket) => {
+  const openDeleteModal = (t: QueryTicket) => {
     if (!userProfile) return;
+    setDeleteError('');
     setDeleteModalTicket(t);
-    setCheckingSaved(true);
-    setSavedCountInTargetChat(0);
-    try {
-      const q = query(
-        collection(db, 'savedAnswers'),
-        where('studentId', '==', userProfile.uid),
-        where('queryId', '==', t.id)
-      );
-      const snap = await getDocs(q);
-      setSavedCountInTargetChat(snap.size);
-    } catch (e) {
-      console.error('Error checking saved bookmarks:', e);
-    } finally {
-      setCheckingSaved(false);
-    }
   };
 
   const handleTouchStart = (t: QueryTicket) => {
@@ -145,46 +109,18 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
   const confirmDeleteForMe = async () => {
     if (!deleteModalTicket || !userProfile) return;
     setDeletingForMe(true);
+    setDeleteError('');
     try {
-      const ref = doc(db, 'queries', deleteModalTicket.id);
-      await updateDoc(ref, {
-        deletedForUsers: arrayUnion(userProfile.uid),
-      });
-
-      // If user had bookmarked answers in this query, remove them
-      if (savedCountInTargetChat > 0) {
-        const q = query(
-          collection(db, 'savedAnswers'),
-          where('studentId', '==', userProfile.uid),
-          where('queryId', '==', deleteModalTicket.id)
-        );
-        const snap = await getDocs(q);
-        snap.forEach(async (d) => {
-          await deleteDoc(doc(db, 'savedAnswers', d.id)).catch(() => {});
-        });
-      }
-
-      // Also clean up notifications for this admin regarding this deleted chat
-      try {
-        const notifQ = query(
-          collection(db, 'notifications'),
-          where('userId', '==', userProfile.uid),
-          where('queryId', '==', deleteModalTicket.id)
-        );
-        const notifSnap = await getDocs(notifQ);
-        notifSnap.forEach(async (d) => {
-          await deleteDoc(doc(db, 'notifications', d.id)).catch(() => {});
-        });
-      } catch (err) {
-        console.warn('Error clearing notifications for deleted query:', err);
-      }
-
-      if (activeTicket?.id === deleteModalTicket.id) {
+      // The server hides the chat for me and removes my saved answers and notifications for it.
+      await api.post(`/queries/${encodeURIComponent(deleteModalTicket.id)}/hide`);
+      const hiddenId = deleteModalTicket.id;
+      setAssignedTickets((prev) => prev.filter((t) => t.id !== hiddenId));
+      if (activeTicket?.id === hiddenId) {
         setActiveTicket(null);
       }
       setDeleteModalTicket(null);
     } catch (e) {
-      console.error('Delete for me error:', e);
+      setDeleteError(errorMessage(e, 'Could not delete this chat. Please try again.'));
     } finally {
       setDeletingForMe(false);
     }
@@ -197,62 +133,19 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
     else if (currentTab === 'assigned-queries') setFilter('all');
   }, [currentTab]);
 
+  // Keep the open chat in sync with the live list (and preselect the newest on desktop).
   useEffect(() => {
-    if (!userProfile) return;
-
-    // Load initial cached assigned queries
-    const cached = offlineStorage.get<QueryTicket[]>(`cc_admin_queries_${userProfile.uid}`, []);
-    if (cached && cached.length > 0) {
-      setAssignedTickets(cached);
-      setLoading(false);
-    }
-
-    // Normal Admin sees queries assigned to them
-    const q = query(
-      collection(db, 'queries'),
-      where('expertId', '==', userProfile.uid)
-    );
-
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const items: QueryTicket[] = [];
-        snapshot.forEach((d) => {
-          items.push({ id: d.id, ...d.data() } as QueryTicket);
-        });
-
-        // Sort descending by last reply or creation timestamp
-        items.sort((a, b) => (b.lastReplyAt || b.createdAt) - (a.lastReplyAt || a.createdAt));
-        setAssignedTickets(items);
-        offlineStorage.set(`cc_admin_queries_${userProfile.uid}`, items);
-
-        // Keep activeTicket in sync with latest Firestore snapshot
-        setActiveTicket((prev) => {
-          const visible = items.filter(
-            (t) => !Array.isArray(t.deletedForUsers) || !t.deletedForUsers.includes(userProfile.uid)
-          );
-          if (!prev) {
-            return (typeof window !== 'undefined' && window.innerWidth >= 1280 && visible.length > 0)
-              ? visible[0]
-              : null;
-          }
-          const updated = items.find((t) => t.id === prev.id);
-          return updated || prev;
-        });
-        setLoading(false);
-      },
-      (error) => {
-        const cachedFallback = offlineStorage.get<QueryTicket[]>(`cc_admin_queries_${userProfile.uid}`, []);
-        if (cachedFallback && cachedFallback.length > 0) {
-          setAssignedTickets(cachedFallback);
-        }
-        setLoading(false);
-        handleFirestoreError(error, OperationType.LIST, 'queries');
+    if (loading) return;
+    setActiveTicket((prev) => {
+      const visible = assignedTickets.filter(
+        (t) => !Array.isArray(t.deletedForUsers) || !t.deletedForUsers.includes(userProfile?.uid || '')
+      );
+      if (!prev) {
+        return typeof window !== 'undefined' && window.innerWidth >= 1280 && visible.length > 0 ? visible[0] : null;
       }
-    );
-
-    return () => unsubscribe();
-  }, [userProfile]);
+      return assignedTickets.find((t) => t.id === prev.id) || prev;
+    });
+  }, [assignedTickets, loading, userProfile?.uid]);
 
   // Active tickets visible to this admin (not deleted for me)
   const activeUserTickets = assignedTickets.filter(
@@ -276,37 +169,10 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
     return true;
   });
 
-  const handleUpdateStatus = async (status: QueryTicket['status']) => {
-    if (!activeTicket) return;
-    try {
-      const ref = doc(db, 'queries', activeTicket.id);
-      const updates: any = {
-        status,
-        updatedAt: Date.now(),
-      };
-      if (status === 'resolved') {
-        updates.rating = null;
-        updates.ratingFeedback = '';
-        updates.ratingTags = [];
-        updates.ratedAt = null;
-      }
-      await updateDoc(ref, updates);
-      setActiveTicket((prev) => (prev ? { ...prev, ...updates } : null));
-
-      if (status === 'resolved' && activeTicket.studentId) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: activeTicket.studentId,
-          title: `Query Resolved: ${activeTicket.ticketNumber}`,
-          message: `Counselor ${userProfile?.displayName || ''} marked your query as resolved. You can now leave feedback!`,
-          type: 'query_resolved',
-          queryId: activeTicket.id,
-          isRead: false,
-          createdAt: Date.now(),
-        }).catch(() => {});
-      }
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `queries/${activeTicket.id}`);
-    }
+  /** ConversationView has already saved the status; just sync local state. */
+  const handleTicketUpdated = (updated: QueryTicket) => {
+    setActiveTicket((prev) => (prev && prev.id === updated.id ? updated : prev));
+    setAssignedTickets((prev) => sortByActivity([updated, ...prev.filter((t) => t.id !== updated.id)]));
   };
 
   const formatWhatsAppTime = (timestamp: number) => {
@@ -605,7 +471,7 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
           {activeTicket ? (
             <ConversationView
               ticket={activeTicket}
-              onUpdateTicketStatus={handleUpdateStatus}
+              onUpdateTicketStatus={handleTicketUpdated}
               onClose={handleCloseChat}
             />
           ) : (
@@ -640,26 +506,13 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
               </div>
             </div>
 
-            {checkingSaved ? (
-              <div className="py-4 text-center text-xs text-slate-500">
-                Checking saved bookmarks...
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {savedCountInTargetChat > 0 ? (
-                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs flex items-start gap-2.5">
-                    <Bookmark className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                    <div>
-                      <strong className="block font-bold">⚠️ Notice: {savedCountInTargetChat} Saved Bookmark{savedCountInTargetChat > 1 ? 's' : ''}!</strong>
-                      <p className="mt-0.5 text-amber-800 leading-relaxed text-[11px]">
-                        This chat contains bookmarked messages. Deleting this chat for yourself will remove them from your saved view.
-                      </p>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-xs text-slate-600 leading-relaxed">
-                    This conversation will only be removed from your view. The student will retain their copy for counseling records.
-                  </p>
+            <div className="space-y-3">
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  This conversation will only be removed from your view. The student will retain their copy for counseling records.
+                </p>
+
+                {deleteError && (
+                  <p className="text-[11px] text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-2">{deleteError}</p>
                 )}
 
                 <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
@@ -682,7 +535,6 @@ export const NormalAdminDashboard: React.FC<NormalAdminDashboardProps> = ({
                   </button>
                 </div>
               </div>
-            )}
           </div>
         </div>
       )}

@@ -1,17 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  onSnapshot,
-  doc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useState, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { CategoryItem, UserProfile, QueryTicket, formatRoleName } from '../../types';
+import { api, errorMessage } from '../../lib/api';
+import { useApiResource, useLiveQueries } from '../../lib/liveData';
+import { CategoryItem, UserProfile, formatRoleName } from '../../types';
 import { sortCategoriesGeneralFirst } from '../../constants/officialCategories';
 import { CustomSelect } from '../common/CustomSelect';
 import {
@@ -30,17 +21,24 @@ import {
 
 export const CategoryManagement: React.FC = () => {
   const { userProfile } = useAuth();
-  const isSuperAdmin =
-    userProfile?.role === 'super_admin' ||
-    userProfile?.email?.toLowerCase() === 'mentoflux@gmail.com';
-  const isExpertAdmin =
-    userProfile?.role === 'expert_admin' ||
-    (!isSuperAdmin && userProfile?.email?.toLowerCase() === 'huzaifa678ops@gmail.com');
+  const isSuperAdmin = userProfile?.role === 'super_admin';
+  const isExpertAdmin = userProfile?.role === 'expert_admin';
   const canManageCategories = isSuperAdmin || isExpertAdmin;
 
-  const [categories, setCategories] = useState<CategoryItem[]>([]);
-  const [admins, setAdmins] = useState<UserProfile[]>([]);
-  const [queries, setQueries] = useState<QueryTicket[]>([]);
+  const { data: rawCategories } = useApiResource<CategoryItem[]>('/categories', ['categories'], []);
+  const { data: rawAdmins } = useApiResource<UserProfile[]>('/admins', ['users'], []);
+  // Ticket counts per category (managers only; the server also refuses to delete used categories).
+  const { queries } = useLiveQueries({ scope: 'all', enabled: canManageCategories });
+
+  const categories = useMemo(() => sortCategoriesGeneralFirst(rawCategories), [rawCategories]);
+  const admins = useMemo(
+    () =>
+      rawAdmins
+        .filter((u) => ['normal_admin', 'expert_admin', 'super_admin'].includes(u.role))
+        .sort((a, b) => (a.displayName || '').localeCompare(b.displayName || '')),
+    [rawAdmins]
+  );
+
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -60,89 +58,6 @@ export const CategoryManagement: React.FC = () => {
   const [deleteModalCategory, setDeleteModalCategory] = useState<CategoryItem | null>(null);
   const [deleteWarning, setDeleteWarning] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-
-  // Listen to categories with null-safe mapping
-  useEffect(() => {
-    const q = query(collection(db, 'categories'));
-    const unsub = onSnapshot(
-      q,
-      (snapshot) => {
-        const list: CategoryItem[] = [];
-        snapshot.forEach((d) => {
-          const data = d.data();
-          const adminIds = Array.isArray(data.assignedAdminIds)
-            ? data.assignedAdminIds
-            : Array.isArray(data.assignedExpertIds)
-            ? data.assignedExpertIds
-            : [];
-
-          list.push({
-            id: d.id,
-            name: String(data.name || 'Untitled Category'),
-            description: String(data.description || ''),
-            subcategories: Array.isArray(data.subcategories) ? data.subcategories : [],
-            assignedAdminIds: adminIds,
-            primaryAdminId: data.primaryAdminId ? String(data.primaryAdminId) : undefined,
-            backupAdminId: data.backupAdminId ? String(data.backupAdminId) : undefined,
-            status: data.status === 'inactive' ? 'inactive' : 'active',
-            createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
-            updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : Date.now(),
-          });
-        });
-        setCategories(sortCategoriesGeneralFirst(list));
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.LIST, 'categories');
-      }
-    );
-
-    // Listen to admins
-    const qAdmins = query(collection(db, 'users'));
-    const unsubAdmins = onSnapshot(
-      qAdmins,
-      (snapshot) => {
-        const list: UserProfile[] = [];
-        const seen = new Set<string>();
-        snapshot.forEach((d) => {
-          const u = d.data() as UserProfile;
-          if (['normal_admin', 'expert_admin', 'super_admin'].includes(u.role)) {
-            const key = (u.email || u.displayName || d.id).trim().toLowerCase();
-            if (!seen.has(key)) {
-              seen.add(key);
-              list.push({ ...u, uid: d.id });
-            }
-          }
-        });
-        list.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
-        setAdmins(list);
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.LIST, 'users');
-      }
-    );
-
-    // Listen to queries to guard deletion
-    const qQueries = query(collection(db, 'queries'));
-    const unsubQueries = onSnapshot(
-      qQueries,
-      (snapshot) => {
-        const list: QueryTicket[] = [];
-        snapshot.forEach((d) => {
-          list.push({ id: d.id, ...d.data() } as QueryTicket);
-        });
-        setQueries(list);
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.LIST, 'queries');
-      }
-    );
-
-    return () => {
-      unsub();
-      unsubAdmins();
-      unsubQueries();
-    };
-  }, []);
 
   const openCreateModal = () => {
     setEditingCategory(null);
@@ -176,61 +91,32 @@ export const CategoryManagement: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const now = Date.now();
-      const catId = editingCategory ? editingCategory.id : `cat-${Date.now()}`;
-
-      const payload: Record<string, any> = {
-        id: catId,
+      const backupAdminId =
+        editingCategory?.backupAdminId && assignedAdminIds.includes(editingCategory.backupAdminId)
+          ? editingCategory.backupAdminId
+          : undefined;
+      const payload = {
         name: name.trim(),
         description: description?.trim() || '',
         subcategories: editingCategory?.subcategories || [],
         assignedAdminIds: assignedAdminIds || [],
+        primaryAdminId: primaryAdminId || assignedAdminIds[0] || undefined,
+        backupAdminId,
         status: categoryStatus,
-        createdAt: editingCategory ? editingCategory.createdAt : now,
-        updatedAt: now,
       };
 
-      if (primaryAdminId) {
-        payload.primaryAdminId = primaryAdminId;
+      // The server keeps admins' assignedCategories in sync with assignedAdminIds.
+      if (editingCategory) {
+        await api.put<CategoryItem>(`/admin/categories/${encodeURIComponent(editingCategory.id)}`, payload);
       } else {
-        payload.primaryAdminId = assignedAdminIds.length > 0 ? assignedAdminIds[0] : '';
-      }
-
-      await setDoc(doc(db, 'categories', catId), payload);
-
-      // Sync assigned categories back into user profiles
-      for (const admin of admins) {
-        try {
-          const shouldHave = assignedAdminIds.includes(admin.uid);
-          const currentAssigned = Array.isArray(admin.assignedCategories)
-            ? admin.assignedCategories
-            : [];
-          const has = currentAssigned.includes(catId);
-
-          if (shouldHave && !has) {
-            const userRef = doc(db, 'users', admin.uid);
-            await updateDoc(userRef, {
-              assignedCategories: [...currentAssigned, catId],
-              updatedAt: now,
-            });
-          } else if (!shouldHave && has) {
-            const userRef = doc(db, 'users', admin.uid);
-            await updateDoc(userRef, {
-              assignedCategories: currentAssigned.filter((c) => c !== catId),
-              updatedAt: now,
-            });
-          }
-        } catch (adminErr) {
-          console.warn('Could not sync admin categories:', adminErr);
-        }
+        await api.post<CategoryItem>('/admin/categories', payload);
       }
 
       setShowModal(false);
       setSuccessMessage(`Category "${name.trim()}" saved successfully.`);
       setTimeout(() => setSuccessMessage(null), 4000);
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.WRITE, 'categories');
-      setError(err.message || 'Error saving category.');
+    } catch (err) {
+      setError(errorMessage(err, 'Error saving category.'));
     } finally {
       setLoading(false);
     }
@@ -251,13 +137,14 @@ export const CategoryManagement: React.FC = () => {
     if (!deleteModalCategory) return;
     setDeleting(true);
     try {
-      await deleteDoc(doc(db, 'categories', deleteModalCategory.id));
+      await api.del(`/admin/categories/${encodeURIComponent(deleteModalCategory.id)}`);
       setDeleteModalCategory(null);
       setSuccessMessage(`Category "${deleteModalCategory.name}" removed successfully.`);
       setTimeout(() => setSuccessMessage(null), 4000);
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.DELETE, `categories/${deleteModalCategory.id}`);
-      setDeleteWarning(err.message || 'Error deleting category.');
+    } catch (err) {
+      // 409 when tickets still reference the category: show the server's message.
+      setDeleteModalCategory(null);
+      setDeleteWarning(errorMessage(err, 'Error deleting category.'));
     } finally {
       setDeleting(false);
     }
@@ -363,11 +250,7 @@ export const CategoryManagement: React.FC = () => {
         ) : (
           filteredCategories.map((cat, idx) => {
             const queryCount = queries.filter((q) => q.categoryId === cat.id).length;
-            const catAdminIds = Array.isArray(cat.assignedAdminIds)
-              ? cat.assignedAdminIds
-              : Array.isArray((cat as any).assignedExpertIds)
-              ? (cat as any).assignedExpertIds
-              : [];
+            const catAdminIds = Array.isArray(cat.assignedAdminIds) ? cat.assignedAdminIds : [];
             const assignedCount = catAdminIds.length;
             const assignedAdminsList = admins.filter((a) => catAdminIds.includes(a.uid));
             const catStatus = cat.status || 'active';

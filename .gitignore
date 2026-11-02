@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+.data/
+
+# Firebase service-account keys (used once for the Firestore import)
+*service-account*.json
+*-firebase-adminsdk-*.json

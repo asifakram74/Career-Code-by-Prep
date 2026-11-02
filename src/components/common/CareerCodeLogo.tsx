@@ -33,7 +33,7 @@ export const CareerCodeLogo: React.FC<CareerCodeLogoProps> = ({
         if (imgSrc === careerCodeLogoAsset) {
           setImgSrc('/career-code-logo.jpg');
         } else if (imgSrc === '/career-code-logo.jpg') {
-          setImgSrc('/assets/aistudio/images_87b77b11.jpg');
+          setImgSrc('/career-code-logo.jpg');
         }
       }}
       className={`object-cover bg-white border border-pink-100 shadow-xs shadow-pink-200 shrink-0 ${sizeClasses} ${className}`}

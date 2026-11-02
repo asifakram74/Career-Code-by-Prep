@@ -11,19 +11,19 @@
   "background_color": "#ffffff",
   "icons": [
     {
-      "src": "/assets/aistudio/images_87b77b11.jpg",
+      "src": "/career-code-logo.jpg",
       "sizes": "192x192",
       "type": "image/jpeg",
       "purpose": "any"
     },
     {
-      "src": "/assets/aistudio/images_87b77b11.jpg",
+      "src": "/career-code-logo.jpg",
       "sizes": "512x512",
       "type": "image/jpeg",
       "purpose": "any"
     },
     {
-      "src": "/assets/aistudio/images_87b77b11.jpg",
+      "src": "/career-code-logo.jpg",
       "sizes": "512x512",
       "type": "image/jpeg",
       "purpose": "maskable"

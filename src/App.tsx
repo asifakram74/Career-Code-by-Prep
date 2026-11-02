@@ -26,14 +26,12 @@ import { DriveExplorer } from './components/drive/DriveExplorer';
 import { ArticlesSection } from './components/articles/ArticlesSection';
 import { ReviewsAnalyticsDashboard } from './components/admin/ReviewsAnalyticsDashboard';
 import { CareerCodeLogo } from './components/common/CareerCodeLogo';
-import { QuotaNoticeBanner } from './components/common/QuotaNoticeBanner';
 import { QueryTicket } from './types';
-import { doc, getDoc, updateDoc } from 'firebase/firestore';
-import { db } from './lib/firebase';
+import { api } from './lib/api';
 import { navigationHistory, NavState } from './lib/navigationHistory';
 
 function MainApp() {
-  const { currentUser, userProfile, loading } = useAuth();
+  const { userProfile, loading } = useAuth();
   const { markNotificationsForQueryAsRead } = useNotifications();
   const [currentTab, setCurrentTab] = useState<string>('');
   const [activeTicket, setActiveTicket] = useState<QueryTicket | null>(null);
@@ -153,13 +151,7 @@ function MainApp() {
       markNotificationsForQueryAsRead(qId);
 
       try {
-        const docRef = doc(db, 'queries', qId);
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          handleOpenTicket({ id: docSnap.id, ...docSnap.data() } as QueryTicket);
-        } else {
-          handleNavigateTab(userProfile?.role === 'student' ? 'replies' : 'personal-queries');
-        }
+        handleOpenTicket(await api.get<QueryTicket>(`/queries/${qId}`));
       } catch {
         handleNavigateTab(userProfile?.role === 'student' ? 'replies' : 'personal-queries');
       }
@@ -210,7 +202,6 @@ function MainApp() {
 
     return (
       <div className="animate-fade-in min-h-screen">
-        <QuotaNoticeBanner />
         <LandingPage
           onSignIn={() => handleSetAuthMode('login')}
           onGetStarted={() => handleSetAuthMode('register')}
@@ -223,7 +214,6 @@ function MainApp() {
   if (viewLanding) {
     return (
       <div className="animate-fade-in min-h-screen">
-        <QuotaNoticeBanner />
         <LandingPage
           onSignIn={() => setViewLanding(false)}
           onGetStarted={() => setViewLanding(false)}
@@ -241,17 +231,9 @@ function MainApp() {
           <ConversationView
             ticket={activeTicket}
             onClose={handleCloseTicket}
-            onUpdateTicketStatus={async (newStatus) => {
-              const ref = doc(db, 'queries', activeTicket.id);
-              const updates: any = { status: newStatus, updatedAt: Date.now() };
-              if (newStatus === 'resolved') {
-                updates.rating = null;
-                updates.ratingFeedback = '';
-                updates.ratingTags = [];
-                updates.ratedAt = null;
-              }
-              await updateDoc(ref, updates);
-              setActiveTicket((prev) => (prev ? { ...prev, ...updates } : null));
+            onUpdateTicketStatus={(updated) => {
+              // ConversationView performs the API call; keep the open ticket in sync.
+              setActiveTicket((prev) => (prev && prev.id === updated.id ? updated : prev));
             }}
           />
         </div>
@@ -420,7 +402,6 @@ function MainApp() {
 
   return (
     <div className="min-h-screen bg-pink-50/25 flex flex-col font-sans text-slate-900 antialiased">
-      <QuotaNoticeBanner />
       <Navbar
         onNavigateTab={handleNavigateTab}
         currentTab={effectiveTab}

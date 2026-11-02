@@ -26,6 +26,18 @@ export const ReviewsCarousel: React.FC<ReviewsCarouselProps> = ({ onGetStarted }
     return () => unsubscribe();
   }, []);
 
+  // Build a perpetual, seamless track that NEVER goes blank regardless of screen width.
+  // Each set (setA and setB) is duplicated to contain at least 8 items.
+  const displayReviews = useMemo(() => {
+    if (reviews.length === 0) return [];
+    let setA: UnifiedReviewItem[] = [];
+    while (setA.length < 8) {
+      setA = [...setA, ...reviews];
+    }
+    // setB is an exact mirror of setA so translateX(-50%) creates a seamless, mathematically identical loop
+    return [...setA, ...setA];
+  }, [reviews]);
+
   const handleManualScroll = (direction: 'left' | 'right') => {
     if (!scrollContainerRef.current) return;
     const scrollAmount = 380;
@@ -80,18 +92,6 @@ export const ReviewsCarousel: React.FC<ReviewsCarouselProps> = ({ onGetStarted }
   // Calculate real average rating from genuine student submissions
   const sumRatings = reviews.reduce((acc, r) => acc + r.rating, 0);
   const realAverage = (sumRatings / reviews.length).toFixed(1);
-
-  // Build a perpetual, seamless track that NEVER goes blank regardless of screen width.
-  // Each set (setA and setB) is duplicated to contain at least 8 items.
-  const displayReviews = useMemo(() => {
-    if (reviews.length === 0) return [];
-    let setA: UnifiedReviewItem[] = [];
-    while (setA.length < 8) {
-      setA = [...setA, ...reviews];
-    }
-    // setB is an exact mirror of setA so translateX(-50%) creates a seamless, mathematically identical loop
-    return [...setA, ...setA];
-  }, [reviews]);
 
   return (
     <div className="relative py-4 select-none">

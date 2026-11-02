@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { DriveItem, DriveConfig } from '../../types';
 import {
   fetchDriveFolderContents,
@@ -6,6 +6,7 @@ import {
   formatFileSize,
 } from '../../lib/driveService';
 import { useAuth } from '../../context/AuthContext';
+import { errorMessage } from '../../lib/api';
 import { DriveFilePreviewModal } from './DriveFilePreviewModal';
 import { SuperAdminDriveModal } from './SuperAdminDriveModal';
 import {
@@ -24,6 +25,7 @@ import {
   Share2,
   Check,
   X,
+  AlertCircle,
 } from 'lucide-react';
 
 interface BreadcrumbItem {
@@ -43,20 +45,34 @@ export const DriveExplorer: React.FC = () => {
   const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
   const [showConfigModal, setShowConfigModal] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // 'missing' = no Drive root has been configured yet.
+  const [configState, setConfigState] = useState<'loading' | 'ready' | 'missing' | 'error'>('loading');
+  const [configError, setConfigError] = useState<string>('');
+  const [folderError, setFolderError] = useState<string>('');
+  // Incremented per folder request so a slow, older response can't overwrite a newer folder.
+  const folderRequestSeq = useRef(0);
 
   const isSuperAdmin = userProfile?.role === 'super_admin' || userProfile?.role === 'expert_admin';
 
-  // Load configuration on mount - reads Firestore directly
-  useEffect(() => {
+  // Load the configured Drive root on mount
+  const loadConfig = () => {
     let isMounted = true;
     setLoading(true);
+    setConfigError('');
+    setConfigState('loading');
 
     getDriveConfig()
       .then((cfg) => {
         if (!isMounted) return;
         setDriveConfig(cfg);
-        const rootId = cfg?.rootFolderId || '1EVDluFkST7Z2xZ3_RZusko8VYjlk-Ih_';
-        const rootName = cfg?.rootFolderName || 'Career Code Data';
+        if (!cfg || !cfg.rootFolderId) {
+          setConfigState('missing');
+          setLoading(false);
+          return;
+        }
+        setConfigState('ready');
+        const rootId = cfg.rootFolderId;
+        const rootName = cfg.rootFolderName || 'Career Code Data';
 
         // Check if history already has a folder state (e.g. from popstate or restore)
         const curState = (typeof window !== 'undefined' ? window.history?.state : null) as any;
@@ -76,15 +92,18 @@ export const DriveExplorer: React.FC = () => {
       .catch((err) => {
         console.error('Error fetching drive configuration:', err);
         if (isMounted) {
-          setCurrentFolderId('1EVDluFkST7Z2xZ3_RZusko8VYjlk-Ih_');
-          setBreadcrumbs([{ id: '1EVDluFkST7Z2xZ3_RZusko8VYjlk-Ih_', name: 'Career Code Data' }]);
+          setConfigState('error');
+          setConfigError(errorMessage(err, 'Could not load the Drive configuration.'));
+          setLoading(false);
         }
       });
 
     return () => {
       isMounted = false;
     };
-  }, []);
+  };
+
+  useEffect(() => loadConfig(), []);
 
   // Sync with browser / mobile back button (popstate)
   useEffect(() => {
@@ -109,10 +128,10 @@ export const DriveExplorer: React.FC = () => {
           setCurrentFolderId(state.driveFolderId);
           setBreadcrumbs(state.driveBreadcrumbs);
           setSearchQuery('');
-        } else if (state.level === 1 || !state.driveFolderId) {
+        } else if ((state.level === 1 || !state.driveFolderId) && driveConfig?.rootFolderId) {
           // Popped back to root Drive folder
-          const rootId = driveConfig?.rootFolderId || '1EVDluFkST7Z2xZ3_RZusko8VYjlk-Ih_';
-          const rootName = driveConfig?.rootFolderName || 'Career Code Data';
+          const rootId = driveConfig.rootFolderId;
+          const rootName = driveConfig.rootFolderName || 'Career Code Data';
           setCurrentFolderId(rootId);
           setBreadcrumbs([{ id: rootId, name: rootName }]);
           setSearchQuery('');
@@ -126,11 +145,14 @@ export const DriveExplorer: React.FC = () => {
 
   // Fetch contents whenever current folder changes
   const loadFolderContents = async (folderId: string, isManualRefresh = false) => {
+    const requestId = ++folderRequestSeq.current;
     if (isManualRefresh) setRefreshing(true);
     else setLoading(true);
+    setFolderError('');
 
     try {
       const res = await fetchDriveFolderContents(folderId, isManualRefresh);
+      if (requestId !== folderRequestSeq.current) return; // a newer folder was requested
       setItems(res.items);
       // Update root folder name in breadcrumbs if at root
       if (res.folderName) {
@@ -142,10 +164,15 @@ export const DriveExplorer: React.FC = () => {
         });
       }
     } catch (err) {
+      if (requestId !== folderRequestSeq.current) return;
       console.error('Failed to load drive contents:', err);
+      setItems([]);
+      setFolderError(errorMessage(err, 'Could not load this Drive folder.'));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (requestId === folderRequestSeq.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   };
 
@@ -332,7 +359,7 @@ export const DriveExplorer: React.FC = () => {
             onClick={() => {
               if (currentFolderId) loadFolderContents(currentFolderId, true);
             }}
-            disabled={refreshing || loading}
+            disabled={refreshing || loading || !currentFolderId}
             className="p-2 text-slate-500 hover:text-pink-600 hover:bg-pink-50 rounded-xl transition-colors cursor-pointer border border-slate-200"
             title="Sync latest files from Google Drive"
           >
@@ -415,10 +442,70 @@ export const DriveExplorer: React.FC = () => {
       </div>
 
       {/* Main Content Viewport */}
-      {loading || !currentFolderId ? (
+      {configState === 'missing' ? (
+        <div className="py-16 text-center text-xs text-slate-500 bg-white rounded-2xl border border-slate-200 p-6 sm:p-8">
+          <HardDrive className="w-12 h-12 text-slate-300 mx-auto mb-3" />
+          <p className="font-semibold text-slate-800 text-sm">Google Drive isn't set up yet</p>
+          <p className="text-slate-400 mt-1 max-w-sm mx-auto text-xs">
+            {isSuperAdmin
+              ? 'Connect a public Google Drive folder to share guidance files, roadmaps and audio notes here.'
+              : 'Guidance files will appear here once an administrator connects the Career Code Drive folder.'}
+          </p>
+          {isSuperAdmin && (
+            <button
+              type="button"
+              onClick={handleOpenConfig}
+              className="mt-4 px-3.5 py-2 bg-pink-600 hover:bg-pink-700 text-white rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              <Settings className="w-3.5 h-3.5" />
+              <span>Configure Drive</span>
+            </button>
+          )}
+        </div>
+      ) : configState === 'error' ? (
+        <div className="py-16 text-center text-xs text-slate-500 bg-white rounded-2xl border border-rose-200 p-6 sm:p-8">
+          <AlertCircle className="w-12 h-12 text-rose-300 mx-auto mb-3" />
+          <p className="font-semibold text-slate-800 text-sm">Couldn't connect to Career Code Drive</p>
+          <p className="text-rose-600 mt-1 max-w-sm mx-auto text-xs">{configError}</p>
+          <button
+            type="button"
+            onClick={() => loadConfig()}
+            className="mt-4 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Try again</span>
+          </button>
+        </div>
+      ) : loading || !currentFolderId ? (
         <div className="py-20 text-center text-xs text-slate-400 flex flex-col items-center justify-center bg-white rounded-2xl border border-slate-200">
           <RefreshCw className="w-6 h-6 animate-spin text-pink-600 mb-2" />
           <span>Connecting to Career Code Drive...</span>
+        </div>
+      ) : folderError ? (
+        <div className="py-16 text-center text-xs text-slate-500 bg-white rounded-2xl border border-rose-200 p-6 sm:p-8">
+          <AlertCircle className="w-12 h-12 text-rose-300 mx-auto mb-3" />
+          <p className="font-semibold text-slate-800 text-sm">Couldn't load this folder</p>
+          <p className="text-rose-600 mt-1 max-w-sm mx-auto text-xs">{folderError}</p>
+          <div className="mt-4 flex items-center justify-center gap-2">
+            {breadcrumbs.length > 1 && (
+              <button
+                type="button"
+                onClick={handleBackOneLevel}
+                className="px-3.5 py-2 bg-pink-50 hover:bg-pink-100 text-pink-700 border border-pink-200 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                <span>Back</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => currentFolderId && loadFolderContents(currentFolderId, true)}
+              className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Try again</span>
+            </button>
+          </div>
         </div>
       ) : filteredItems.length === 0 ? (
         <div className="py-16 text-center text-xs text-slate-500 bg-white rounded-2xl border border-slate-200 p-6 sm:p-8">
@@ -620,6 +707,8 @@ export const DriveExplorer: React.FC = () => {
         onConfigSaved={(cfg) => {
           setDriveConfig(cfg);
           if (cfg.rootFolderId) {
+            setConfigState('ready');
+            setConfigError('');
             setCurrentFolderId(cfg.rootFolderId);
             setBreadcrumbs([{ id: cfg.rootFolderId, name: cfg.rootFolderName || 'Drive' }]);
             loadFolderContents(cfg.rootFolderId, true);

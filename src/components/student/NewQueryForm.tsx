@@ -1,17 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  collection,
-  query,
-  where,
-  getDocs,
-  addDoc,
-  doc,
-  updateDoc,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
 import { useAuth } from '../../context/AuthContext';
-import { CategoryItem, UserProfile, AttachmentItem, QueryTicket, QueryStatus } from '../../types';
+import { CategoryItem, UserProfile, QueryTicket } from '../../types';
+import { api, errorMessage, MAX_UPLOAD_BYTES } from '../../lib/api';
 import { sortCategoriesGeneralFirst } from '../../constants/officialCategories';
 import { CustomSelect } from '../common/CustomSelect';
 import {
@@ -43,7 +33,32 @@ import {
   readFileDataUrl,
   formatFileSize,
   ProcessedAttachment,
+  uploadDataUrls,
+  uploadDataUrl,
 } from '../../lib/fileUploadHelper';
+
+const MAX_UPLOAD_LABEL = `${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`;
+const MAX_FILES_PER_QUERY = 10;
+
+/** Counselor as returned by GET /queries-meta/experts. */
+type ExpertOption = Pick<
+  UserProfile,
+  'uid' | 'displayName' | 'role' | 'professionalTitle' | 'shortDescription' | 'photoURL' | 'isOnline' | 'averageRating' | 'ratingCount'
+>;
+
+/** Approximate decoded byte size of a base64 data URL. */
+const dataUrlByteSize = (dataUrl: string) => {
+  const comma = dataUrl.indexOf(',');
+  const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  return Math.round((b64.length * 3) / 4);
+};
+
+const audioExtension = (mime: string) => {
+  if (mime.includes('ogg')) return 'ogg';
+  if (mime.includes('mp4')) return 'm4a';
+  if (mime.includes('aac')) return 'aac';
+  return 'webm';
+};
 
 // Audio Player for recorded voice note preview
 const VoiceNotePlayer: React.FC<{
@@ -191,8 +206,8 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
   // Dynamic Categories and Experts
   const [categories, setCategories] = useState<CategoryItem[]>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
-  const [eligibleExperts, setEligibleExperts] = useState<UserProfile[]>([]);
-  const [selectedExpert, setSelectedExpert] = useState<UserProfile | null>(null);
+  const [eligibleExperts, setEligibleExperts] = useState<ExpertOption[]>([]);
+  const [selectedExpert, setSelectedExpert] = useState<ExpertOption | null>(null);
 
   // Form Fields
   const [title, setTitle] = useState('');
@@ -206,6 +221,8 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
   const [recordedVoiceUrl, setRecordedVoiceUrl] = useState<string | null>(null);
   const [recordedVoiceDuration, setRecordedVoiceDuration] = useState<number>(0);
   const [recordingError, setRecordingError] = useState<string | null>(null);
+  // True between "Done Recording" and the recording being ready to attach
+  const [encodingVoice, setEncodingVoice] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
@@ -302,15 +319,23 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
           type: mimeTypeRef.current || 'audio/webm',
         });
         const reader = new FileReader();
-        reader.onloadend = () => {
+        setEncodingVoice(true);
+        reader.onload = () => {
           const base64Audio = reader.result as string;
           setRecordedVoiceUrl(base64Audio);
           setRecordedVoiceDuration(duration);
+          setEncodingVoice(false);
+        };
+        reader.onerror = reader.onabort = () => {
+          console.error('Error reading voice recording:', reader.error);
+          setRecordingError('Failed to encode voice note. Please record again.');
+          setEncodingVoice(false);
         };
         reader.readAsDataURL(audioBlob);
       } catch (err) {
         console.error('Error encoding voice recording:', err);
         setRecordingError('Failed to encode voice note.');
+        setEncodingVoice(false);
       } finally {
         cleanupAudioStream();
       }
@@ -349,19 +374,19 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
   useEffect(() => {
     const fetchCategories = async () => {
       try {
-        const q = query(collection(db, 'categories'), where('status', '==', 'active'));
-        const snap = await getDocs(q);
+        const items = await api.get<CategoryItem[]>('/categories?status=active');
         const list: CategoryItem[] = [];
         const seenCatIds = new Set<string>();
-        snap.forEach((d) => {
-          if (!seenCatIds.has(d.id)) {
-            seenCatIds.add(d.id);
-            list.push({ id: d.id, ...d.data() } as CategoryItem);
+        items.forEach((c) => {
+          if (c.status === 'active' && !seenCatIds.has(c.id)) {
+            seenCatIds.add(c.id);
+            list.push(c);
           }
         });
         setCategories(sortCategoriesGeneralFirst(list));
       } catch (err) {
-        handleFirestoreError(err, OperationType.LIST, 'categories');
+        console.error('Failed to load categories:', err);
+        setError(errorMessage(err, 'Could not load categories. Please refresh and try again.'));
       } finally {
         setLoadingCategories(false);
       }
@@ -377,6 +402,7 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
       return;
     }
 
+    let cancelled = false;
     const fetchExperts = async () => {
       try {
         const targetCategory = categories.find((c) => c.id === selectedCategoryId);
@@ -386,61 +412,19 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
           return;
         }
 
-        const q = query(
-          collection(db, 'users'),
-          where('status', '==', 'active')
+        // Server returns only active counselors assigned to this category
+        const rawExperts = await api.get<ExpertOption[]>(
+          `/queries-meta/experts?categoryId=${encodeURIComponent(selectedCategoryId)}`
         );
-        const snap = await getDocs(q);
-        const rawExperts: UserProfile[] = [];
+        if (cancelled) return;
 
-        snap.forEach((d) => {
-          const data = d.data();
-          // Guarantee uid is always the Firestore document ID to prevent corrupt fields from shadowing
-          const u = { ...data, uid: d.id } as UserProfile;
-
-          // Only users with an admin/counselor role can be considered
-          if (!['super_admin', 'expert_admin', 'normal_admin'].includes(u.role)) {
-            return;
-          }
-
-          if (u.status === 'deactivated' || (u as any).isDeactivated === true) {
-            return;
-          }
-
-          // Strict assignment check: Only show if explicitly assigned to this category!
-          const isAssigned =
-            (Array.isArray(targetCategory.assignedAdminIds) && targetCategory.assignedAdminIds.includes(u.uid)) ||
-            targetCategory.primaryAdminId === u.uid ||
-            targetCategory.backupAdminId === u.uid ||
-            (Array.isArray(u.assignedCategories) && u.assignedCategories.includes(selectedCategoryId));
-
-          if (isAssigned) {
-            rawExperts.push(u);
-          }
-        });
-
-        // Multi-criteria deduplication to prevent duplicate administrators
-        // Checks UID, normalized email, and display name
         const seenUids = new Set<string>();
-        const seenEmails = new Set<string>();
-        const seenNames = new Set<string>();
-        const uniqueExperts: UserProfile[] = [];
-
+        const uniqueExperts: ExpertOption[] = [];
         for (const exp of rawExperts) {
           const uidKey = (exp.uid || '').trim();
-          const emailKey = (exp.email || '').trim().toLowerCase();
-          const nameKey = (exp.displayName || '').trim().toLowerCase();
-
-          // If already matched by UID, email, or display name, skip duplicate!
-          if (uidKey && seenUids.has(uidKey)) continue;
-          if (emailKey && seenEmails.has(emailKey)) continue;
-          if (nameKey && seenNames.has(nameKey)) continue;
-
-          if (uidKey) seenUids.add(uidKey);
-          if (emailKey) seenEmails.add(emailKey);
-          if (nameKey) seenNames.add(nameKey);
-
-          uniqueExperts.push(exp);
+          if (!uidKey || seenUids.has(uidKey)) continue;
+          seenUids.add(uidKey);
+          uniqueExperts.push({ ...exp, displayName: exp.displayName || 'Counselor' });
         }
 
         // Put primary designated expert first, then alphabetical
@@ -453,14 +437,9 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
         setEligibleExperts(uniqueExperts);
         if (uniqueExperts.length > 0) {
           setSelectedExpert((prev) => {
-            // Keep previously selected if still among the unique eligible experts
+            // Keep previously selected if still among the eligible experts
             if (prev) {
-              const stillValid = uniqueExperts.find(
-                (e) =>
-                  e.uid === prev.uid ||
-                  (e.email && prev.email && e.email.toLowerCase() === prev.email.toLowerCase()) ||
-                  (e.displayName && prev.displayName && e.displayName.toLowerCase() === prev.displayName.toLowerCase())
-              );
+              const stillValid = uniqueExperts.find((e) => e.uid === prev.uid);
               if (stillValid) return stillValid;
             }
             // Otherwise default to the first (primary) expert
@@ -470,11 +449,18 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
           setSelectedExpert(null);
         }
       } catch (err) {
-        handleFirestoreError(err, OperationType.LIST, 'users');
+        if (cancelled) return;
+        console.error('Failed to load counselors:', err);
+        setEligibleExperts([]);
+        setSelectedExpert(null);
+        setError(errorMessage(err, 'Could not load counselors for this category.'));
       }
     };
 
     fetchExperts();
+    return () => {
+      cancelled = true;
+    };
   }, [selectedCategoryId, categories]);
 
   const updateAttachmentProgress = (id: string, progress: number) => {
@@ -504,12 +490,12 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
       }
 
       const isImage = file.type.startsWith('image/');
-      if (!isImage && file.size > 650 * 1024) {
-        setError(`PDF "${file.name}" (${formatFileSize(file.size)}) exceeds the 600KB limit for secure storage. Please compress your PDF or upload photo screenshots.`);
-        continue;
-      }
-      if (isImage && file.size > 10 * 1024 * 1024) {
-        setError(`Image "${file.name}" exceeds 10MB.`);
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(
+          `${isImage ? 'Image' : 'PDF'} "${file.name}" (${formatFileSize(file.size)}) exceeds the ${MAX_UPLOAD_LABEL} per-file limit.${
+            isImage ? '' : ' Please compress your PDF or upload photo screenshots.'
+          }`
+        );
         continue;
       }
 
@@ -613,6 +599,14 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
       setError('Please select an academic or career category.');
       return;
     }
+    if (isRecording) {
+      setError('Please finish your voice recording (tap "Done Recording") or cancel it before submitting.');
+      return;
+    }
+    if (encodingVoice) {
+      setError('Please wait a moment while your voice note is being prepared.');
+      return;
+    }
 
     const finalDetail =
       detail.trim() ||
@@ -642,9 +636,19 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
       return;
     }
 
-    const totalAttachmentBytes = attachments.reduce((sum, a) => sum + (a.finalSize || a.originalSize), 0);
-    if (totalAttachmentBytes > 850 * 1024) {
-      setError('Total attachment payload is too large for secure cloud delivery. Please remove an attachment or upload fewer files.');
+    if (attachments.length > MAX_FILES_PER_QUERY) {
+      setError(`You can attach up to ${MAX_FILES_PER_QUERY} files per query. Please remove some attachments.`);
+      return;
+    }
+
+    const oversized = attachments.find((a) => (a.finalSize || a.originalSize) > MAX_UPLOAD_BYTES);
+    if (oversized) {
+      setError(`"${oversized.name}" exceeds the ${MAX_UPLOAD_LABEL} per-file limit. Please remove it or upload a smaller file.`);
+      return;
+    }
+
+    if (recordedVoiceUrl && dataUrlByteSize(recordedVoiceUrl) > MAX_UPLOAD_BYTES) {
+      setError(`Your voice note exceeds the ${MAX_UPLOAD_LABEL} limit. Please record a shorter voice note.`);
       return;
     }
 
@@ -652,256 +656,37 @@ export const NewQueryForm: React.FC<NewQueryFormProps> = ({
     setUploadProgress(20);
 
     try {
-      const now = Date.now();
-      const ticketNumber = `PT-${Math.floor(100000 + Math.random() * 900000)}`;
+      // 1. Upload attachments and the voice note; the API only accepts uploaded file URLs
+      const uploadedAttachments = await uploadDataUrls(
+        attachments.map((att) => ({ dataUrl: att.dataUrl, name: att.name }))
+      );
+      setUploadProgress(50);
 
-      const currentCategory = categories.find((c) => c.id === selectedCategoryId);
-      const categoryName = currentCategory ? currentCategory.name : 'General Guidance';
+      let audioUrl: string | undefined;
+      if (recordedVoiceUrl) {
+        const mime = recordedVoiceUrl.slice(5, recordedVoiceUrl.indexOf(';')) || mimeTypeRef.current;
+        audioUrl = await uploadDataUrl(recordedVoiceUrl, `voice-note-${Date.now()}.${audioExtension(mime)}`);
+      }
+      setUploadProgress(75);
 
-      setUploadProgress(45);
-
-      // Attachments metadata
-      const attachmentsPayload: AttachmentItem[] = attachments.map((att) => ({
-        id: att.id,
-        name: att.name,
-        size: att.finalSize,
-        type: att.type,
-        url: att.dataUrl,
-      }));
-
-      setUploadProgress(65);
-
-      const newTicketData = {
-        ticketNumber,
-        studentId: userProfile.uid,
-        studentName: userProfile.displayName,
-        studentEmail: userProfile.email,
-        studentPhone: userProfile.phoneNumber || '',
-        studentQualification: userProfile.qualification || 'Not Specified',
-        studentBoard: userProfile.board || '',
-        studentAvatarUrl: userProfile.photoURL || '',
+      // 2. Create the query. The server assigns the ticket number, merges into an existing
+      //    chat with the same counselor, writes the header message and sends notifications.
+      const { ticket } = await api.post<{ ticket: QueryTicket; merged: boolean }>('/queries', {
         categoryId: selectedCategoryId,
-        categoryName,
-        expertId: selectedExpert ? selectedExpert.uid : 'unassigned',
-        expertEmail: selectedExpert?.email ? selectedExpert.email.toLowerCase() : '',
-        expertName: selectedExpert ? selectedExpert.displayName : 'General Expert Queue',
-        expertRole: selectedExpert ? selectedExpert.role : 'normal_admin',
-        expertTitle: selectedExpert?.professionalTitle || 'Admissions Counselor',
-        expertAvatarUrl: selectedExpert?.photoURL || '',
-        assignedAdminId: selectedExpert ? selectedExpert.uid : 'unassigned',
-        assignedAdminName: selectedExpert ? selectedExpert.displayName : 'General Expert Queue',
+        ...(selectedExpert ? { expertId: selectedExpert.uid } : {}),
         title: title.trim(),
         detail: finalDetail,
-        attachments: attachmentsPayload,
-        status: 'open' as QueryStatus,
-        assignmentStatus: (selectedExpert ? 'assigned' : 'unassigned') as 'assigned' | 'unassigned',
-        hasUnreadStudentReply: false,
-        hasUnreadAdminReply: true,
-        isInitialQueryReadByAdmin: false,
-        lastReplyPreview: recordedVoiceUrl
-          ? `🎤 Voice Note: ${title.trim()}`
-          : `📌 Initial Query: ${title.trim()}`,
-        lastReplyAt: now,
-        lastSenderRole: 'student' as const,
-        createdAt: now,
-        updatedAt: now,
-        ...(recordedVoiceUrl ? { audioUrl: recordedVoiceUrl, audioDuration: recordedVoiceDuration || 0 } : {}),
-      };
+        attachments: uploadedAttachments,
+        ...(audioUrl ? { audioUrl, audioDuration: Math.round(recordedVoiceDuration || 0) } : {}),
+      });
 
-      // Determine target mentor ID (either explicitly chosen expert or category primary admin)
-      const targetMentorId =
-        selectedExpert?.uid ||
-        (currentCategory?.primaryAdminId && currentCategory.primaryAdminId !== 'unassigned'
-          ? currentCategory.primaryAdminId
-          : null);
-
-      // If student already has a non-deleted conversation with this mentor, continue in that existing chat!
-      if (targetMentorId) {
-        let matchDoc = null;
-        const qByExpert = query(
-          collection(db, 'queries'),
-          where('studentId', '==', userProfile.uid),
-          where('expertId', '==', targetMentorId)
-        );
-        const snapByExpert = await getDocs(qByExpert);
-        const validDocs: any[] = [];
-        snapByExpert.forEach((d) => {
-          const data = d.data();
-          const isDeletedForStudent = Array.isArray(data.deletedForUsers) && data.deletedForUsers.includes(userProfile.uid);
-          if (!isDeletedForStudent) {
-            validDocs.push(d);
-          }
-        });
-
-        if (validDocs.length === 0) {
-          const qByAdmin = query(
-            collection(db, 'queries'),
-            where('studentId', '==', userProfile.uid),
-            where('assignedAdminId', '==', targetMentorId)
-          );
-          const snapByAdmin = await getDocs(qByAdmin);
-          snapByAdmin.forEach((d) => {
-            const data = d.data();
-            const isDeletedForStudent = Array.isArray(data.deletedForUsers) && data.deletedForUsers.includes(userProfile.uid);
-            if (!isDeletedForStudent) {
-              validDocs.push(d);
-            }
-          });
-        }
-
-        if (validDocs.length > 0) {
-          validDocs.sort((a, b) => {
-            const timeA = a.data().lastReplyAt || a.data().createdAt || 0;
-            const timeB = b.data().lastReplyAt || b.data().createdAt || 0;
-            return timeB - timeA;
-          });
-          matchDoc = validDocs[0];
-        }
-
-        if (matchDoc) {
-          // Use the existing ticket
-          const existingData = matchDoc.data() as QueryTicket;
-          const ticketId = matchDoc.id;
-
-          setUploadProgress(80);
-
-          // 1. Append new query as a prominent follow-up query message in the message thread
-          const msgData: any = {
-            queryId: ticketId,
-            senderId: userProfile.uid,
-            senderName: userProfile.displayName,
-            senderRole: userProfile.role,
-            senderAvatarUrl: userProfile.photoURL || '',
-            content: detail.trim()
-              ? `📌 **New Query: ${title.trim()}**\n\n${detail.trim()}`
-              : `🎤 **Voice Note Query: ${title.trim()}**\n\n(Please listen to the attached voice note for complete query details)`,
-            ...(recordedVoiceUrl ? { audioUrl: recordedVoiceUrl, audioDuration: recordedVoiceDuration || 0 } : {}),
-            attachments: attachmentsPayload,
-            isNewQueryHeader: true,
-            queryTitle: title.trim(),
-            isRead: false,
-            createdAt: now,
-          };
-          await addDoc(collection(db, 'messages'), msgData);
-
-          // 2. Reopen ticket status to open and reset reassigned status to assigned
-          const updatedTicketFields: any = {
-            title: title.trim(),
-            detail: finalDetail,
-            categoryId: selectedCategoryId,
-            categoryName,
-            status: 'open' as QueryStatus,
-            assignmentStatus: 'assigned' as const,
-            reassignedToAdminId: null,
-            reassignedToAdminName: null,
-            hasUnreadStudentReply: false,
-            hasUnreadAdminReply: true,
-            isInitialQueryReadByAdmin: false,
-            lastReplyPreview: recordedVoiceUrl
-              ? `🎤 Voice Note: ${title.trim()}`
-              : `📌 New Query: ${title.trim()}`,
-            lastReplyAt: now,
-            lastSenderRole: 'student' as const,
-            updatedAt: now,
-            rating: null,
-            ratingFeedback: '',
-            ratingTags: [],
-            ratedAt: null,
-            ...(recordedVoiceUrl ? { audioUrl: recordedVoiceUrl, audioDuration: recordedVoiceDuration || 0 } : {}),
-          };
-
-          await updateDoc(doc(db, 'queries', ticketId), updatedTicketFields);
-
-          setUploadProgress(95);
-
-          // 3. Notify mentor of the new query in their existing chat
-          await addDoc(collection(db, 'notifications'), {
-            userId: targetMentorId,
-            title: `New Query from ${userProfile.displayName}: ${existingData.ticketNumber}`,
-            message: `Student asked a new query: "${title.trim().slice(0, 70)}"`,
-            type: 'new_query',
-            queryId: ticketId,
-            isRead: false,
-            createdAt: now,
-          }).catch(() => {});
-
-          await updateActivityTimestamp();
-
-          setUploadProgress(100);
-
-          const combinedTicket: QueryTicket = {
-            ...existingData,
-            ...updatedTicketFields,
-            id: ticketId,
-          };
-
-          onSuccessTicket(combinedTicket);
-          return;
-        }
-      }
-
-      setUploadProgress(85);
-      const docRef = await addDoc(collection(db, 'queries'), newTicketData);
-      setUploadProgress(95);
-
-      // Notify the expert if assigned, otherwise notify category primary admin or admin pool
-      if (selectedExpert) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: selectedExpert.uid,
-          title: `New Query Assigned: ${ticketNumber}`,
-          message: `${userProfile.displayName} submitted: "${title.trim().slice(0, 70)}"`,
-          type: 'new_query',
-          queryId: docRef.id,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      } else if (currentCategory?.primaryAdminId) {
-        await addDoc(collection(db, 'notifications'), {
-          userId: currentCategory.primaryAdminId,
-          title: `New Query in ${categoryName}: ${ticketNumber}`,
-          message: `${userProfile.displayName} submitted: "${title.trim().slice(0, 70)}"`,
-          type: 'new_query',
-          queryId: docRef.id,
-          isRead: false,
-          createdAt: now,
-        }).catch(() => {});
-      } else {
-        try {
-          const adminsSnap = await getDocs(
-            query(collection(db, 'users'), where('role', 'in', ['super_admin', 'expert_admin', 'normal_admin']))
-          );
-          adminsSnap.forEach(async (adminDoc) => {
-            await addDoc(collection(db, 'notifications'), {
-              userId: adminDoc.id,
-              title: `New Student Query: ${ticketNumber}`,
-              message: `${userProfile.displayName} submitted: "${title.trim().slice(0, 70)}"`,
-              type: 'new_query',
-              queryId: docRef.id,
-              isRead: false,
-              createdAt: now,
-            }).catch(() => {});
-          });
-        } catch {}
-      }
-
-      await updateActivityTimestamp();
+      await updateActivityTimestamp().catch(() => {});
       setUploadProgress(100);
 
-      const createdTicket: QueryTicket = {
-        id: docRef.id,
-        ...newTicketData,
-      };
-
-      onSuccessTicket(createdTicket);
+      onSuccessTicket(ticket);
     } catch (err: any) {
       console.error('Error submitting query:', err);
-      handleFirestoreError(err, OperationType.CREATE, 'queries');
-      const errMessage = err?.message || '';
-      if (errMessage.includes('exceeds maximum allowed size')) {
-        setError('Total query content or media is too large. Please remove some attachments or shorten your text.');
-      } else {
-        setError('An error occurred while submitting your ticket. Please retry.');
-      }
+      setError(errorMessage(err, 'An error occurred while submitting your ticket. Please retry.'));
     } finally {
       setSubmitting(false);
       setUploadProgress(0);

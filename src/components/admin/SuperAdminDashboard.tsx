@@ -1,11 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import {
-  collection,
-  query,
-  onSnapshot,
-} from 'firebase/firestore';
-import { db } from '../../lib/firebase';
-import { handleFirestoreError, OperationType } from '../../lib/firestoreErrors';
+import React, { useMemo } from 'react';
+import { useApiResource, useLiveQueries } from '../../lib/liveData';
 import { useAuth } from '../../context/AuthContext';
 import { UserProfile, QueryTicket, CategoryItem, formatRoleName } from '../../types';
 import { sortCategoriesGeneralFirst } from '../../constants/officialCategories';
@@ -35,37 +29,10 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   onOpenTicket,
 }) => {
   const { userProfile } = useAuth();
-  const [users, setUsers] = useState<UserProfile[]>([]);
-  const [queries, setQueries] = useState<QueryTicket[]>([]);
-  const [categories, setCategories] = useState<CategoryItem[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const unsubUsers = onSnapshot(collection(db, 'users'), (snapshot) => {
-      const list: UserProfile[] = [];
-      snapshot.forEach((d) => list.push({ uid: d.id, ...d.data() } as UserProfile));
-      setUsers(list);
-    });
-
-    const unsubQueries = onSnapshot(collection(db, 'queries'), (snapshot) => {
-      const list: QueryTicket[] = [];
-      snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as QueryTicket));
-      setQueries(list);
-    });
-
-    const unsubCategories = onSnapshot(collection(db, 'categories'), (snapshot) => {
-      const list: CategoryItem[] = [];
-      snapshot.forEach((d) => list.push({ id: d.id, ...d.data() } as CategoryItem));
-      setCategories(sortCategoriesGeneralFirst(list));
-      setLoading(false);
-    });
-
-    return () => {
-      unsubUsers();
-      unsubQueries();
-      unsubCategories();
-    };
-  }, []);
+  const { data: users } = useApiResource<UserProfile[]>('/admin/users', ['users'], []);
+  const { queries } = useLiveQueries({ scope: 'all' });
+  const { data: rawCategories } = useApiResource<CategoryItem[]>('/categories', ['categories'], []);
+  const categories = useMemo(() => sortCategoriesGeneralFirst(rawCategories), [rawCategories]);
 
   // Real Database Metrics Calculations
   const totalStudents = users.filter((u) => u.role === 'student').length;
@@ -110,8 +77,10 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   adminWorkload.sort((a, b) => b.count - a.count);
 
   // Recent Unassigned / New Queries
+  // Oldest waiting first, so the longest-unanswered tickets surface at the top.
   const highPriorityQueries = queries
     .filter((q) => q.status === 'open' || q.assignmentStatus === 'unassigned')
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
     .slice(0, 5);
 
   return (
@@ -398,7 +367,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
                         : 'bg-pink-50 text-pink-700 border border-pink-200'
                     }`}
                   >
-                    {t.assignmentStatus === 'unassigned' ? 'UNASSIGNED' : t.status.toUpperCase()}
+                    {t.assignmentStatus === 'unassigned' ? 'UNASSIGNED' : (t.status || 'open').toUpperCase()}
                   </span>
                   <p className="text-[10px] text-slate-400 mt-0.5 tabular-nums">
                     {new Date(t.createdAt).toLocaleDateString()}

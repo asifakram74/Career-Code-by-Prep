@@ -32,6 +32,8 @@ export interface UserProfile {
   lastActiveAt: number; // millisecond timestamp
   lastReplyAt?: number;
   isOnline?: boolean;
+  /** Set after an admin creates the account or resets its password. */
+  mustChangePassword?: boolean;
 }
 
 export interface AdminCategoryAssignment {
@@ -137,7 +139,16 @@ export interface NotificationItem {
   userId: string;
   title: string;
   message: string;
-  type: 'query_update' | 'new_reply' | 'new_query' | 'admin_alert' | 'assignment' | 'query_rating' | 'coffee_treat';
+  type:
+    | 'query_update'
+    | 'new_reply'
+    | 'new_query'
+    | 'admin_alert'
+    | 'assignment'
+    | 'query_rating'
+    | 'query_resolved'
+    | 'coffee_treat'
+    | 'platform_review';
   queryId?: string;
   isRead: boolean;
   createdAt: number;
@@ -169,6 +180,8 @@ export interface SavedAnswerItem {
   id: string;
   studentId: string;
   queryId: string;
+  /** The bookmarked reply, when saved from a specific chat message. */
+  messageId?: string;
   queryTitle: string;
   categoryName: string;
   expertName: string;

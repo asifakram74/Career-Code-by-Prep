@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { DriveItem } from '../../types';
-import { formatFileSize } from '../../lib/driveService';
+import { formatFileSize, driveFileStreamUrl } from '../../lib/driveService';
 import {
   X,
   ExternalLink,
@@ -53,16 +53,14 @@ export const DriveFilePreviewModal: React.FC<DriveFilePreviewModalProps> = ({ it
 
   if (!item) return null;
 
-  // Real Audio Streaming Endpoint from our Express proxy
-  const audioStreamUrl =
-    item.id && !item.id.startsWith('file-')
-      ? `/api/drive/audio-stream?fileId=${item.id}&filename=${encodeURIComponent(item.name)}`
-      : item.webViewLink;
+  // Audio is streamed through our server so seeking works
+  const audioStreamUrl = item.id ? driveFileStreamUrl(item.id) : item.webViewLink;
+  const encodedId = encodeURIComponent(item.id || '');
 
   // Derive Google Drive preview URL (for PDFs, docs, videos)
   const getPreviewUrl = (id: string, webViewLink: string) => {
-    if (id && !id.startsWith('file-') && !id.startsWith('folder-')) {
-      return `https://drive.google.com/file/d/${id}/preview`;
+    if (id) {
+      return `https://drive.google.com/file/d/${encodeURIComponent(id)}/preview`;
     }
     return webViewLink || `https://docs.google.com/viewer?url=${encodeURIComponent(webViewLink)}&embedded=true`;
   };
@@ -131,8 +129,8 @@ export const DriveFilePreviewModal: React.FC<DriveFilePreviewModalProps> = ({ it
   const isImage = item.type === 'image';
 
   const downloadUrl =
-    item.id && !item.id.startsWith('file-')
-      ? `https://drive.google.com/uc?export=download&id=${item.id}`
+    item.id
+      ? `https://drive.google.com/uc?export=download&id=${encodedId}`
       : item.webContentLink || item.webViewLink;
 
   return (
@@ -370,7 +368,7 @@ export const DriveFilePreviewModal: React.FC<DriveFilePreviewModalProps> = ({ it
                     <span>Opening in Google Drive web player...</span>
                   </div>
                   <iframe
-                    src={`https://drive.google.com/file/d/${item.id}/preview`}
+                    src={`https://drive.google.com/file/d/${encodedId}/preview`}
                     className="w-full h-28 border-0 rounded-lg bg-white shadow-xs"
                     title={item.name}
                     allow="autoplay"

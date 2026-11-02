@@ -191,12 +191,22 @@ export const ArticleEditorModal: React.FC<ArticleEditorModalProps> = ({
     }
   };
 
-  // Sync initial content on open or article change
+  // Sync fields and content on open or when a different article is being edited
+  // (useState initializers above only run on the first render).
+  const initialArticleId = initialArticle?.id;
   React.useEffect(() => {
-    if (isOpen && editorRef.current) {
+    if (!isOpen) return;
+    setTitle(initialArticle?.title || '');
+    setDescription(initialArticle?.description || '');
+    setCategory(initialArticle?.category || CATEGORY_OPTIONS[0]);
+    setCustomCategory('');
+    setCoverImage(initialArticle?.coverImage || '');
+    setErrorMsg(null);
+    if (editorRef.current) {
       editorRef.current.innerHTML = initialArticle?.content || '';
     }
-  }, [isOpen, initialArticle]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, initialArticleId]);
 
   // Listen to selection changes to keep toolbar state in sync
   React.useEffect(() => {
@@ -319,16 +329,32 @@ export const ArticleEditorModal: React.FC<ArticleEditorModalProps> = ({
     if (!url || !url.trim()) return;
 
     let finalUrl = url.trim();
-    if (!finalUrl.startsWith('http://') && !finalUrl.startsWith('https://')) {
+    if (!/^https?:\/\//i.test(finalUrl)) {
       finalUrl = `https://${finalUrl}`;
     }
+    try {
+      const parsed = new URL(finalUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      finalUrl = parsed.href;
+    } catch {
+      window.alert('Please enter a valid web link.');
+      return;
+    }
+    const escapeHtml = (value: string) =>
+      value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    const safeUrl = escapeHtml(finalUrl);
 
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.toString().trim() === '') {
       document.execCommand(
         'insertHTML',
         false,
-        `<a href="${finalUrl}" target="_blank" rel="noopener noreferrer">${finalUrl}</a>&nbsp;`
+        `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeUrl}</a>&nbsp;`
       );
     } else {
       document.execCommand('createLink', false, finalUrl);

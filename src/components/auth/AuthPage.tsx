@@ -30,7 +30,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
   onSuccessRole,
   onBackToLanding,
 }) => {
-  const { login, registerStudent } = useAuth();
+  const { login, registerStudent, resetPassword } = useAuth();
   const [mode, setMode] = useState<'login' | 'register'>(initialMode);
 
   React.useEffect(() => {
@@ -87,6 +87,17 @@ export const AuthPage: React.FC<AuthPageProps> = ({
     }
   };
 
+  // Self-service resets aren't available; resetPassword explains whom to contact.
+  const handleForgotPassword = async () => {
+    setError(null);
+    setSuccessMsg(null);
+    try {
+      await resetPassword(email);
+    } catch (err: any) {
+      setError(err?.message || 'Please contact an administrator to reset your password.');
+    }
+  };
+
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -104,8 +115,8 @@ export const AuthPage: React.FC<AuthPageProps> = ({
       setError('Phone number is required for counselor communication.');
       return;
     }
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters.');
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.');
       return;
     }
     if (password !== confirmPassword) {
@@ -264,6 +275,15 @@ export const AuthPage: React.FC<AuthPageProps> = ({
                     {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
+                <div className="flex justify-end mt-1">
+                  <button
+                    type="button"
+                    onClick={handleForgotPassword}
+                    className="text-[11px] font-semibold text-pink-600 hover:text-pink-700 cursor-pointer"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
               </div>
 
               <button
@@ -393,7 +413,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
                     required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Min. 6 chars"
+                    placeholder="Min. 8 chars"
                     className="block w-full px-3 py-2 border border-slate-300 rounded-lg text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent"
                   />
                 </div>
