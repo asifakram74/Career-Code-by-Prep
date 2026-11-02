@@ -24,6 +24,9 @@ async function connect(): Promise<Database> {
     return database;
   }
 
+  if (config.isProduction) {
+    throw new Error('DATABASE_URL must be set in production (the embedded PGlite database is for development only).');
+  }
   const { PGlite } = await import('@electric-sql/pglite');
   fs.mkdirSync(path.dirname(config.pgliteDir), { recursive: true });
   const client = new PGlite(config.pgliteDir);
