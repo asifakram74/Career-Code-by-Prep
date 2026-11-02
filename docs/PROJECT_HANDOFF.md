@@ -145,8 +145,9 @@ npm run dev                     # http://localhost:3000
 
 ## 6. Next planned work
 
-1. **Security review + full QA of the product** with a written report → `docs/SECURITY_QA_REPORT.md` (in progress as of the date above).
-2. Fix what the report finds.
+1. ✅ **Security review + full QA** done 2026-11-02 → `docs/SECURITY_QA_REPORT.md`
+   (0 critical, 3 high, 14 medium, 23 low). Re-runnable API suite: `tests/api-scenario.mjs` (see `tests/README.md`).
+2. **Fix what the report finds** — order in report §7 (H1 article XSS + CSP first, then H2/H3, M1–M5).
 3. Import real data, test Drive with a real key, deploy to VPS following `DEPLOYMENT.md`.
 
 ---
